@@ -16,12 +16,9 @@ Its brain, per tick:
 
 ## Watch controls
 
-- **1× WATCH** — real-time play, the way you'd play it.
-- **4×** — four times faster.
-- **MAX** — as fast as the AI can decide, to find the peak score quickly.
-- **PAUSE / RESTART** — freeze the game, or start a fresh run.
+Two small icons under the game, nothing else covering it: **pause** (⏸/▶) and **restart** (↻). It plays at normal speed. The game's own HUD shows the score and best.
 
-The panel shows the current strategy (PATROL / HUNTING / SURVIVING / WAITING OUT HAZARD), score, best, and runs played.
+When a run ends, the AI records the score and starts a new run on its own, so it keeps chasing a higher best.
 
 ## Results (headless testing)
 
@@ -30,5 +27,5 @@ The panel shows the current strategy (PATROL / HUNTING / SURVIVING / WAITING OUT
 
 ## Files
 
-- `index.html` — the game (logic identical to Neon Serpent №10, plus a one-line turbo gate so the AI can drive steps at 4×/MAX) with the AI and watch panel.
+- `index.html` — the game (logic identical to Neon Serpent №10, plus a one-line pause gate so the pause icon can freeze stepping) with the AI and two icon buttons.
 - `test_ai.py` — headless Playwright test: plays at MAX, logs deaths and best score.

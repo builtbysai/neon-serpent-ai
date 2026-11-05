@@ -273,10 +273,9 @@ function step(){
 function update(dt){
   elapsed+=dt;
   if(splitPause>0){ splitPause-=dt; }
-  // AI turbo gate: when the AI drives steps itself (4x / MAX), the game's
-  // own rAF loop must not step too, or the AI would miss decisions. The
-  // game logic below is otherwise identical to the shipped game.
-  else if(mode==='play' && !window.__nsTurbo){
+  // AI pause gate: the pause icon freezes stepping. The game logic below
+  // is otherwise identical to the shipped game.
+  else if(mode==='play' && !window.__nsPaused){
     tickAcc+=dt*1000;
     while(tickAcc>=tickMs){ tickAcc-=tickMs; step(); if(mode!=='play') break; }
   }
@@ -560,31 +559,15 @@ window.__ns={ get mode(){return mode}, get score(){return score}, get best(){ret
   setScore(n){ score=n; } };
 </script>
 <style>
-  #ai-panel{ position:fixed; left:0; right:0; bottom:0; z-index:20;
-    background:rgba(6,6,16,.9); border-top:1px solid rgba(150,170,255,.22);
-    color:#dfe6ff; font-family:ui-monospace,Menlo,Consolas,monospace;
-    padding:10px 14px calc(10px + env(safe-area-inset-bottom,0px));
-    backdrop-filter:blur(6px); }
-  #ai-panel .r1{ display:flex; gap:14px; align-items:baseline; font-size:12px; letter-spacing:.08em; }
-  #ai-panel .badge{ background:#22e6ff; color:#061018; font-weight:800; padding:2px 7px; border-radius:3px; letter-spacing:.14em; }
-  #ai-panel #ai-strategy{ color:#ff4fd8; font-weight:700; }
-  #ai-panel b{ color:#fff; font-size:15px; }
-  #ai-panel .r2{ display:flex; gap:8px; margin-top:8px; }
-  #ai-panel button{ flex:1; background:#141830; color:#cfd6ff; border:1px solid rgba(150,170,255,.35);
-    border-radius:8px; padding:9px 4px; font:700 12px ui-monospace,Menlo,Consolas,monospace; letter-spacing:.06em; cursor:pointer; }
-  #ai-panel button.on{ background:#22e6ff; color:#061018; border-color:#22e6ff; }
-  #ai-panel .note{ margin-top:7px; font-size:10.5px; color:#8b93ad; letter-spacing:.03em; }
+  #ai-ctl{ position:fixed; left:0; right:0; bottom:calc(14px + env(safe-area-inset-bottom,0px)); z-index:20;
+    display:flex; justify-content:center; gap:10px; pointer-events:none; }
+  #ai-ctl button{ pointer-events:auto; width:44px; height:44px; border-radius:50%;
+    border:1px solid rgba(255,255,255,.18); background:rgba(10,12,26,.45); color:#cfd6ff;
+    cursor:pointer; backdrop-filter:blur(6px); display:flex; align-items:center; justify-content:center; }
 </style>
-<div id="ai-panel">
-  <div class="r1"><span class="badge">AI</span><span id="ai-strategy">STARTING</span><span>SCORE <b id="ai-score">0</b></span><span>BEST <b id="ai-best">0</b></span><span>RUNS <b id="ai-runs">0</b></span></div>
-  <div class="r2">
-    <button data-speed="1" class="on">1× WATCH</button>
-    <button data-speed="4">4×</button>
-    <button data-speed="0">MAX</button>
-    <button id="ai-pause">PAUSE</button>
-    <button id="ai-restart">RESTART</button>
-  </div>
-  <div class="note">Same controls as you: the AI only issues swipe directions through the game's own input. Game logic identical to Neon Serpent №10.</div>
+<div id="ai-ctl">
+  <button id="ai-pause" aria-label="pause"><svg viewBox="0 0 24 24" width="18" height="18"><rect x="6" y="5" width="4" height="14" fill="currentColor"/><rect x="14" y="5" width="4" height="14" fill="currentColor"/></svg></button>
+  <button id="ai-restart" aria-label="restart"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 3v5h-5"/></svg></button>
 </div>
 <script>
 "use strict";
@@ -596,11 +579,11 @@ window.__ns={ get mode(){return mode}, get score(){return score}, get best(){ret
    to food that keeps enough free space for both snakes to survive. When
    no path to food exists it maximises free space and waits out hazards. */
 const AI = {
-  speed: 1, paused: false, runs: 0, sessionBest: 0,
+  paused: false, runs: 0, sessionBest: 0,
   allBest: parseInt(localStorage.getItem('nsai_best')||'0',10),
   strategy: 'STARTING', grow: 0, lastScore: 0,
   lastHeads: '', lastMode: 'menu', lastSplit: false,
-  turboTimer: null, restartTimer: null,
+  restartTimer: null,
 };
 const AI_DIRS = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
 const AI_NAMES = ['up','down','left','right'];
@@ -776,15 +759,6 @@ function aiDecide(){
     foods: st.foods, hazards: st.hazards.length, label: AI.strategy });
   if(window.__AI_DEBUG.decisions.length>40) window.__AI_DEBUG.decisions.shift();
 }
-function aiUpdatePanel(st){
-  const el=(id)=>document.getElementById(id);
-  if(st){
-    el('ai-score').textContent = st.score;
-    el('ai-best').textContent = Math.max(AI.allBest, AI.sessionBest, st.score);
-    el('ai-runs').textContent = AI.runs;
-    el('ai-strategy').textContent = AI.strategy;
-  }
-}
 function aiRunOver(){
   const st = aiState(); const sc = st?st.score:0;
   if(window.__AI_DEBUG && st){
@@ -799,21 +773,19 @@ function aiRunOver(){
   if(sc>AI.sessionBest) AI.sessionBest=sc;
   if(sc>AI.allBest){ AI.allBest=sc; localStorage.setItem('nsai_best', String(sc)); }
   AI.strategy='RUN OVER — '+sc;
-  aiUpdatePanel(st);
   clearTimeout(AI.restartTimer);
   AI.restartTimer=setTimeout(()=>{
     if(!AI.paused && window.__ns && window.__ns.mode==='over') window.__ns.start();
-  }, AI.speed===1?1200:200);
+  }, 1200);
 }
 function aiPoll(){
   const st = aiState(); if(!st) return;
   if(st.mode==='play' && AI.lastMode!=='play'){
     AI.grow=0; AI.lastScore=0; AI.lastHeads=''; AI.lastSplit=false;
   }
-  // At turbo speeds the turbo loop owns every decision and the grow
-  // tracker; the poll must not decide or it races the turbo loop and
-  // feeds it stale directions. At 1x the poll decides after each step.
-  if(st.mode==='play' && AI.speed===1 && !AI.paused){
+  // Normal speed only: the game's own loop steps, the poll decides once
+  // after each observed step.
+  if(st.mode==='play' && !AI.paused){
     const heads = st.snakes.map(s=>aiKey(s.body[0].x,s.body[0].y)).join('|');
     if(heads!==AI.lastHeads){
       if(st.split && !AI.lastSplit) AI.grow=0;
@@ -824,45 +796,14 @@ function aiPoll(){
   }
   if(st.mode==='over' && AI.lastMode==='play') aiRunOver();
   AI.lastMode = st.mode;
-  aiUpdatePanel(st);
 }
-function aiTurboCycle(){
-  if(AI.paused || !window.__ns || window.__ns.mode!=='play') return;
-  aiDecide();
-  window.__ns.stepNow();
-  const st = aiState(); if(!st) return;
-  const ate = st.score > AI.lastScore;
-  if(st.split && !AI.lastSplit) AI.grow=0;
-  else AI.grow = Math.max(0, AI.grow-1) + (ate?1:0);
-  AI.lastScore = st.score; AI.lastSplit = st.split;
-  AI.lastHeads = st.snakes.map(s=>aiKey(s.body[0].x,s.body[0].y)).join('|');
-}
-function aiApplyTurbo(){
-  window.__nsTurbo = AI.paused || AI.speed!==1;
-  clearInterval(AI.turboTimer); AI.turboTimer=null;
-  if(!AI.paused && AI.speed!==1){
-    const per = AI.speed===4 ? 1 : 12;
-    const ms = AI.speed===4 ? 40 : 20;
-    AI.turboTimer = setInterval(()=>{
-      for(let i=0;i<per;i++){
-        aiTurboCycle();
-        if(!window.__ns || window.__ns.mode!=='play') break;
-      }
-    }, ms);
-  }
-}
-function aiSetSpeed(n){
-  AI.speed=n;
-  document.querySelectorAll('#ai-panel [data-speed]').forEach(b=>b.classList.toggle('on', +b.dataset.speed===n));
-  aiApplyTurbo();
-}
-document.querySelectorAll('#ai-panel [data-speed]').forEach(b=>{
-  b.addEventListener('click', ()=>aiSetSpeed(+b.dataset.speed));
-});
+const AI_ICON_PAUSE='<svg viewBox="0 0 24 24" width="18" height="18"><rect x="6" y="5" width="4" height="14" fill="currentColor"/><rect x="14" y="5" width="4" height="14" fill="currentColor"/></svg>';
+const AI_ICON_PLAY='<svg viewBox="0 0 24 24" width="18" height="18"><path d="M7 4l13 8-13 8z" fill="currentColor"/></svg>';
 document.getElementById('ai-pause').addEventListener('click', ()=>{
   AI.paused=!AI.paused;
-  document.getElementById('ai-pause').textContent = AI.paused?'RESUME':'PAUSE';
-  aiApplyTurbo();
+  window.__nsPaused = AI.paused;
+  document.getElementById('ai-pause').innerHTML = AI.paused?AI_ICON_PLAY:AI_ICON_PAUSE;
+  document.getElementById('ai-pause').setAttribute('aria-label', AI.paused?'play':'pause');
 });
 document.getElementById('ai-restart').addEventListener('click', ()=>{
   if(window.__ns){ AI.grow=0; AI.lastScore=0; AI.lastHeads=''; AI.lastSplit=false; window.__ns.start(); }
