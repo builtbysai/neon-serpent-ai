@@ -574,16 +574,22 @@ window.__ns={ get mode(){return mode}, get score(){return score}, get best(){ret
 /* Neon Serpent AI — plays the shipped game through its own input.
    Every decision goes through window.__ns.setDir(), the exact function a
    swipe calls. The AI never touches positions, scores, or internals.
-   Per tick it simulates each legal direction for BOTH snakes, rejects any
-   move that kills either one, then picks the move with the shortest path
-   to food that keeps enough free space for both snakes to survive. When
-   no path to food exists it maximises free space and waits out hazards. */
+   v2 brain, per tick:
+   - PATROL: a Hamiltonian cycle (see below) is the survival backbone.
+   - REJOIN: when a hazard forces the snakes off the cycle, a joint
+     BFS path back to the nearest cycle cell (verified step by step
+     with moving bodies) is followed through, instead of replanning
+     every tick. A voluntary food shortcut was tried and dropped: it
+     pulled the snakes off the safe cycle and they died there.
+   - Otherwise a greedy planner: simulate each legal direction for BOTH
+     snakes, reject any move that kills either one, prefer the shortest
+     path to food that keeps both snakes able to reach their own tails. */
 const AI = {
   paused: false, runs: 0, sessionBest: 0,
   allBest: parseInt(localStorage.getItem('nsai_best')||'0',10),
   strategy: 'STARTING', grow: 0, lastScore: 0,
   lastHeads: '', lastMode: 'menu', lastSplit: false,
-  restartTimer: null,
+  ticksSinceEat: 0, committedPath: null, restartTimer: null,
 };
 const AI_DIRS = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
 const AI_NAMES = ['up','down','left','right'];
@@ -678,12 +684,137 @@ function aiCycleDirName(st){
   if(d.y===-1) return 'up';
   return 'down';
 }
+// Cycle order (insertion order of the map) gives each cell an index, so
+// the distance along the cycle from the head to any on-cycle food is cheap.
+const AI_CYCLE_KEYS = [...AI_CYCLE.keys()];
+const AI_CYCLE_IDX = new Map(AI_CYCLE_KEYS.map((k,i)=>[k,i]));
+const AI_CYCLE_LEN = AI_CYCLE_KEYS.length;
+function aiCycleDist(fromKey, toKey){
+  const a=AI_CYCLE_IDX.get(fromKey), b=AI_CYCLE_IDX.get(toKey);
+  if(a===undefined||b===undefined) return Infinity;
+  return (b-a+AI_CYCLE_LEN)%AI_CYCLE_LEN;
+}
+// ---------- pathfinder (shortcuts + detours) ----------
+// BFS over the JOINT state: the state is cyan's cell; magenta's cell is
+// the offset mirror (12-x, y+6), so a move is valid only when BOTH
+// snakes' next cells are free. A cyan-only BFS can return a path that
+// walks magenta into a wall or body, which is how the AI used to loop
+// forever flip-flopping between a shortcut and the patrol.
+// Returns {dirs:[direction names for cyan...], len, end:{x,y}} or null.
+// The first step never reverses `curDir` (the game rejects reverses).
+function aiPath(sx, sy, blocked, targets, COLS, ROWS, curDir){
+  const tset = new Set(targets.map(t=>aiKey(t.x,t.y)));
+  if(tset.has(aiKey(sx,sy))) return {dirs:[], len:0, end:{x:sx,y:sy}};
+  const DIRS4=[['up',0,-1],['down',0,1],['left',-1,0],['right',1,0]];
+  const prev = new Map();
+  const seen = new Set([aiKey(sx,sy)]);
+  let frontier=[[sx,sy]];
+  while(frontier.length){
+    const next=[];
+    for(const cell of frontier){
+      const cx=cell[0], cy=cell[1];
+      const mx=12-cx, my=cy+6; // magenta head for this cyan cell
+      for(const step of DIRS4){
+        const nm=step[0], dx=step[1], dy=step[2];
+        if(cx===sx && cy===sy && curDir && dx===-curDir.x && dy===-curDir.y) continue;
+        const nx=cx+dx, ny=cy+dy;
+        const nmx=mx-dx, nmy=my+dy; // magenta moves by mirror(d)
+        if(nx<0||nx>=COLS||ny<0||ny>=ROWS) continue;
+        if(nmx<0||nmx>=COLS||nmy<0||nmy>=ROWS) continue;
+        const k=aiKey(nx,ny), km=aiKey(nmx,nmy);
+        if(seen.has(k)||blocked.has(k)||blocked.has(km)) continue;
+        seen.add(k);
+        prev.set(k,{from:aiKey(cx,cy), dir:nm});
+        if(tset.has(k)){
+          const dirs=[]; let kk=k;
+          while(kk!==aiKey(sx,sy)){ const p=prev.get(kk); dirs.unshift(p.dir); kk=p.from; }
+          return {dirs:dirs, len:dirs.length, end:{x:nx,y:ny}};
+        }
+        next.push([nx,ny]);
+      }
+    }
+    frontier=next;
+  }
+  return null;
+}
+// Simulate a whole path step by step with MOVING bodies (tails vacate,
+// growth on eating), exactly as the game steps. Returns true only if
+// every step is non-fatal for both snakes and the end position is
+// survivable (each head can still reach its own tail). A static BFS can
+// bless a path whose later steps run into a body that has since moved;
+// this is the gate that stops the AI committing to those.
+function aiSimulatePath(dirs, st){
+  const COLS=st.COLS, ROWS=st.ROWS;
+  let bodies = st.snakes.map(s=>s.body.map(c=>({x:c.x,y:c.y})));
+  let grow = AI.grow;
+  const haz = new Set(st.hazards.map(h=>aiKey(h.x,h.y)));
+  const foodSet = new Set(st.foods.map(f=>aiKey(f.x,f.y)));
+  for(const name of dirs){
+    const d=AI_DIRS[name];
+    const md = bodies.length===2 ? aiMirror(d) : null;
+    const nh = bodies.map((b,i)=>({x:b[0].x+(i===0?d.x:md.x), y:b[0].y+(i===0?d.y:md.y)}));
+    for(const h of nh) if(h.x<0||h.x>=COLS||h.y<0||h.y>=ROWS) return false;
+    if(bodies.length===2 && nh[0].x===nh[1].x && nh[0].y===nh[1].y) return false;
+    for(const h of nh){
+      if(haz.has(aiKey(h.x,h.y))) return false;
+      for(let j=0;j<bodies.length;j++){
+        const lim = grow===0 ? bodies[j].length-1 : bodies[j].length;
+        for(let k=0;k<lim;k++) if(bodies[j][k].x===h.x && bodies[j][k].y===h.y) return false;
+      }
+    }
+    const ate = nh.some(h=>foodSet.has(aiKey(h.x,h.y)));
+    bodies = bodies.map((b,i)=>{
+      const nb=[nh[i]].concat(b);
+      if(grow===0) nb.pop();
+      return nb;
+    });
+    grow = Math.max(0, grow-1) + (ate?1:0);
+  }
+  const blocked = new Set();
+  bodies.forEach(b=>b.forEach(c=>blocked.add(aiKey(c.x,c.y))));
+  haz.forEach(k=>blocked.add(k));
+  for(let i=0;i<bodies.length;i++){
+    const tail = bodies[i][bodies[i].length-1];
+    const blk = new Set(blocked);
+    blk.delete(aiKey(tail.x,tail.y));
+    if(!isFinite(aiBFS(bodies[i][0].x, bodies[i][0].y, blk, [tail], COLS, ROWS))) return false;
+  }
+  return true;
+}
 function aiDecide(){
   const st = aiState(); if(!st || st.mode!=='play' || AI.paused) return;
   const COLS=st.COLS, ROWS=st.ROWS, snakes=st.snakes, foods=st.foods, hazards=st.hazards;
   const split = snakes.length===2;
   const cur = snakes[0].dir;
   const cyc = aiCycleDirName(st); // the cycle move, when the head is on it
+  // Shortcut: BFS to the nearest food through currently-free cells
+  // (bodies with vacating tails + hazards blocked). Worth taking when it
+  // beats looping around the cycle to the same food — including food the
+  // cycle never reaches (off-cycle: centre column, outer rows), which is
+  // how the score gets past the cycle-confined cap.
+  const curBlocked = new Set();
+  snakes.forEach(s=>{
+    const lim = AI.grow===0 ? s.body.length-1 : s.body.length;
+    for(let i=0;i<lim;i++) curBlocked.add(aiKey(s.body[i].x, s.body[i].y));
+  });
+  hazards.forEach(h=>curBlocked.add(aiKey(h.x,h.y)));
+  let commitDir=null;
+  // Rejoin: when the head is off the cycle (after dodging a hazard), path
+  // back to the nearest cycle cell and commit to it, instead of
+  // replanning every tick. A voluntary shortcut to food was tried and
+  // dropped: it pulled the snakes off the safe cycle and they died
+  // there (best 44 vs 68 for pure patrol). The cycle is the safety
+  // backbone; detours exist only to get back on it.
+  if(AI.committedPath && AI.committedPath.length){
+    commitDir = AI.committedPath[0];
+  } else if(split){
+    const hd = snakes[0].body[0];
+    if(!AI_CYCLE.has(aiKey(hd.x,hd.y))){
+      const cycleCells = AI_CYCLE_KEYS.map(k=>{ const p=k.split(','); return {x:+p[0], y:+p[1]}; });
+      const p = aiPath(hd.x, hd.y, curBlocked, cycleCells, COLS, ROWS, cur);
+      if(p && p.dirs.length && aiSimulatePath(p.dirs, st)){ AI.committedPath = p.dirs.slice(); commitDir = p.dirs[0]; }
+    }
+  }
   // solid cells for the death check: old bodies, tail excluded iff it vacates
   const solid = new Set();
   snakes.forEach(s=>{
@@ -740,17 +871,30 @@ function aiDecide(){
     // backbone. Greedy only takes over when the cycle move is fatal
     // (a hazard sitting on the cycle) or the head is off the cycle.
     const cycleBonus = (name===cyc) ? 20000 : 0;
+    // A committed rejoin path wins over patrolling: follow the plan through.
+    // The candidate loop's death check is still the hard gate — a fatal
+    // committed step is skipped and the plan is dropped.
+    const commitBonus = (name===commitDir) ? 40000 : 0;
+    // Prefer landing back on the cycle after a detour, so the patrol resumes.
+    const rejoinBonus = AI_CYCLE.has(aiKey(nh[0].x, nh[0].y)) ? 5000 : 0;
     if(hasPath){
-      value = cycleBonus + (safe?10000:0) + 5000 - dMin*10 + minSpace + (eats?500:0) + (name===(cur.x===1?'right':cur.x===-1?'left':cur.y===-1?'up':'down')?1:0);
-      label = name===cyc ? 'PATROL' : (eats?'HUNTING — EATING':'HUNTING');
+      value = commitBonus + cycleBonus + rejoinBonus + (safe?10000:0) + 5000 - dMin*10 + minSpace + (eats?500:0) + (name===(cur.x===1?'right':cur.x===-1?'left':cur.y===-1?'up':'down')?1:0);
+      label = name===commitDir ? 'REJOIN' : (name===cyc ? 'PATROL' : (eats?'HUNTING — EATING':'HUNTING'));
     } else {
-      value = cycleBonus + (safe?10000:0) - 5000 + minSpace;
-      label = name===cyc ? 'PATROL' : (hazards.length?'WAITING OUT HAZARD':'SURVIVING');
+      value = commitBonus + cycleBonus + rejoinBonus + (safe?10000:0) - 5000 + minSpace;
+      label = name===commitDir ? 'REJOIN' : (name===cyc ? 'PATROL' : (hazards.length?'WAITING OUT HAZARD':'SURVIVING'));
     }
     if(value>bestVal){ bestVal=value; best=name; bestLabel=label; }
   }
   if(best){ AI.strategy=bestLabel; window.__ns.setDir(best); }
   else AI.strategy='NO SAFE MOVE';
+  // Consume the committed plan when its step is taken; drop it when the
+  // plan's step was not taken (it was fatal, or something beat it).
+  if(AI.committedPath && AI.committedPath.length){
+    if(best===commitDir) AI.committedPath.shift();
+    else AI.committedPath=null;
+    if(AI.committedPath && !AI.committedPath.length) AI.committedPath=null;
+  }
   // debug: keep the last decision so a death can be explained
   window.__AI_DEBUG = window.__AI_DEBUG || { decisions: [], deaths: [] };
   window.__AI_DEBUG.decisions.push({ score: st.score, grow: AI.grow, dir: best,
@@ -781,7 +925,7 @@ function aiRunOver(){
 function aiPoll(){
   const st = aiState(); if(!st) return;
   if(st.mode==='play' && AI.lastMode!=='play'){
-    AI.grow=0; AI.lastScore=0; AI.lastHeads=''; AI.lastSplit=false;
+    AI.grow=0; AI.lastScore=0; AI.lastHeads=''; AI.lastSplit=false; AI.ticksSinceEat=0;
   }
   // Normal speed only: the game's own loop steps, the poll decides once
   // after each observed step.
@@ -790,6 +934,7 @@ function aiPoll(){
     if(heads!==AI.lastHeads){
       if(st.split && !AI.lastSplit) AI.grow=0;
       else { const ate = st.score > AI.lastScore; AI.grow = Math.max(0, AI.grow-1) + (ate?1:0); }
+      if(st.score > AI.lastScore) AI.ticksSinceEat=0; else AI.ticksSinceEat++;
       AI.lastScore = st.score; AI.lastHeads = heads; AI.lastSplit = st.split;
       aiDecide();
     }
