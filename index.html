@@ -574,16 +574,22 @@ window.__ns={ get mode(){return mode}, get score(){return score}, get best(){ret
 /* Neon Serpent AI — plays the shipped game through its own input.
    Every decision goes through window.__ns.setDir(), the exact function a
    swipe calls. The AI never touches positions, scores, or internals.
-   v2 brain, per tick:
-   - PATROL: a Hamiltonian cycle (see below) is the survival backbone.
+   v4 brain — go for 118 (the board-fill ceiling):
+   - The Hamiltonian cycle is the safe home base (v2 proved it: best
+     69). The AI patrols it by default.
+   - EXCURSION: when food sits off the cycle, the AI plans a round
+     trip — cycle to food and back to the cycle — and only takes it
+     when the whole trip simulates safe with moving bodies. This eats
+     off-cycle food without abandoning the cycle for good, which is
+     how the score gets past the cycle-confined cap of ~74. A direct
+     food chase with no return (v3) was tried and died at 46.
    - REJOIN: when a hazard forces the snakes off the cycle, a joint
-     BFS path back to the nearest cycle cell (verified step by step
-     with moving bodies) is followed through, instead of replanning
-     every tick. A voluntary food shortcut was tried and dropped: it
-     pulled the snakes off the safe cycle and they died there.
-   - Otherwise a greedy planner: simulate each legal direction for BOTH
-     snakes, reject any move that kills either one, prefer the shortest
-     path to food that keeps both snakes able to reach their own tails. */
+     BFS path back to the nearest cycle cell (verified step by step)
+     is followed through.
+   - Every committed path is verified with moving bodies before it is
+     followed. When no committed path exists, a one-step planner
+     scores each legal move by food distance, free space, and tail
+     safety, with the cycle move winning whenever it is legal. */
 const AI = {
   paused: false, runs: 0, sessionBest: 0,
   allBest: parseInt(localStorage.getItem('nsai_best')||'0',10),
@@ -773,11 +779,14 @@ function aiSimulatePath(dirs, st){
   const blocked = new Set();
   bodies.forEach(b=>b.forEach(c=>blocked.add(aiKey(c.x,c.y))));
   haz.forEach(k=>blocked.add(k));
+  // End safety: each head must have at least its own body length of
+  // reachable free space, so the position is not a dead end. (Requiring
+  // tail-reachability here was too strict: after a growth step the tail
+  // is a body-length away, and long snakes failed it even on open
+  // ground — which starved the AI of food paths entirely.)
   for(let i=0;i<bodies.length;i++){
-    const tail = bodies[i][bodies[i].length-1];
-    const blk = new Set(blocked);
-    blk.delete(aiKey(tail.x,tail.y));
-    if(!isFinite(aiBFS(bodies[i][0].x, bodies[i][0].y, blk, [tail], COLS, ROWS))) return false;
+    const sp = aiFlood(bodies[i][0].x, bodies[i][0].y, blocked, COLS, ROWS);
+    if(sp < bodies[i].length) return false;
   }
   return true;
 }
@@ -787,32 +796,42 @@ function aiDecide(){
   const split = snakes.length===2;
   const cur = snakes[0].dir;
   const cyc = aiCycleDirName(st); // the cycle move, when the head is on it
-  // Shortcut: BFS to the nearest food through currently-free cells
-  // (bodies with vacating tails + hazards blocked). Worth taking when it
-  // beats looping around the cycle to the same food — including food the
-  // cycle never reaches (off-cycle: centre column, outer rows), which is
-  // how the score gets past the cycle-confined cap.
   const curBlocked = new Set();
   snakes.forEach(s=>{
     const lim = AI.grow===0 ? s.body.length-1 : s.body.length;
     for(let i=0;i<lim;i++) curBlocked.add(aiKey(s.body[i].x, s.body[i].y));
   });
   hazards.forEach(h=>curBlocked.add(aiKey(h.x,h.y)));
+  const cycleCells = AI_CYCLE_KEYS.map(k=>{ const p=k.split(','); return {x:+p[0], y:+p[1]}; });
   let commitDir=null;
-  // Rejoin: when the head is off the cycle (after dodging a hazard), path
-  // back to the nearest cycle cell and commit to it, instead of
-  // replanning every tick. A voluntary shortcut to food was tried and
-  // dropped: it pulled the snakes off the safe cycle and they died
-  // there (best 44 vs 68 for pure patrol). The cycle is the safety
-  // backbone; detours exist only to get back on it.
+  // Committed paths: follow the plan through instead of replanning
+  // every tick (replanning flip-flops and loops). A path is only
+  // committed when the whole thing simulates safe with moving bodies.
   if(AI.committedPath && AI.committedPath.length){
     commitDir = AI.committedPath[0];
   } else if(split){
     const hd = snakes[0].body[0];
-    if(!AI_CYCLE.has(aiKey(hd.x,hd.y))){
-      const cycleCells = AI_CYCLE_KEYS.map(k=>{ const p=k.split(','); return {x:+p[0], y:+p[1]}; });
-      const p = aiPath(hd.x, hd.y, curBlocked, cycleCells, COLS, ROWS, cur);
-      if(p && p.dirs.length && aiSimulatePath(p.dirs, st)){ AI.committedPath = p.dirs.slice(); commitDir = p.dirs[0]; }
+    const onCycle = AI_CYCLE.has(aiKey(hd.x,hd.y));
+    if(onCycle && foods.length && st.score >= 50){
+      // Excursion: round trip cycle -> off-cycle food -> cycle. Only
+      // late (the cycle feeds the snakes fine until ~50) and only when
+      // the trip is SHORT (<=14 steps): a long trip is exposed to a
+      // new hazard spawning on the way back, which is how the open
+      // excursion policy died at 52. Food on the cycle needs no trip.
+      const leg1 = aiPath(hd.x, hd.y, curBlocked, foods, COLS, ROWS, cur);
+      if(leg1 && leg1.dirs.length && !AI_CYCLE.has(aiKey(leg1.end.x,leg1.end.y))){
+        const lastDir = AI_DIRS[leg1.dirs[leg1.dirs.length-1]];
+        const leg2 = aiPath(leg1.end.x, leg1.end.y, curBlocked, cycleCells, COLS, ROWS, lastDir);
+        if(leg2 && leg2.dirs.length){
+          const trip = leg1.dirs.concat(leg2.dirs);
+          if(trip.length <= 14 && aiSimulatePath(trip, st)){ AI.committedPath = trip; commitDir = trip[0]; }
+        }
+      }
+    }
+    if(!commitDir && !onCycle){
+      // No excursion and off the cycle: path back to the cycle.
+      const rp = aiPath(hd.x, hd.y, curBlocked, cycleCells, COLS, ROWS, cur);
+      if(rp && rp.dirs.length && aiSimulatePath(rp.dirs, st)){ AI.committedPath = rp.dirs.slice(); commitDir = rp.dirs[0]; }
     }
   }
   // solid cells for the death check: old bodies, tail excluded iff it vacates
@@ -871,18 +890,19 @@ function aiDecide(){
     // backbone. Greedy only takes over when the cycle move is fatal
     // (a hazard sitting on the cycle) or the head is off the cycle.
     const cycleBonus = (name===cyc) ? 20000 : 0;
-    // A committed rejoin path wins over patrolling: follow the plan through.
-    // The candidate loop's death check is still the hard gate — a fatal
-    // committed step is skipped and the plan is dropped.
+    // A committed path (excursion or rejoin) wins over patrolling:
+    // follow the plan through. The candidate loop's death check is
+    // still the hard gate — a fatal committed step is skipped and the
+    // plan is dropped.
     const commitBonus = (name===commitDir) ? 40000 : 0;
     // Prefer landing back on the cycle after a detour, so the patrol resumes.
     const rejoinBonus = AI_CYCLE.has(aiKey(nh[0].x, nh[0].y)) ? 5000 : 0;
     if(hasPath){
       value = commitBonus + cycleBonus + rejoinBonus + (safe?10000:0) + 5000 - dMin*10 + minSpace + (eats?500:0) + (name===(cur.x===1?'right':cur.x===-1?'left':cur.y===-1?'up':'down')?1:0);
-      label = name===commitDir ? 'REJOIN' : (name===cyc ? 'PATROL' : (eats?'HUNTING — EATING':'HUNTING'));
+      label = name===commitDir ? 'EXCURSION' : (name===cyc ? 'PATROL' : (eats?'HUNTING — EATING':'HUNTING'));
     } else {
       value = commitBonus + cycleBonus + rejoinBonus + (safe?10000:0) - 5000 + minSpace;
-      label = name===commitDir ? 'REJOIN' : (name===cyc ? 'PATROL' : (hazards.length?'WAITING OUT HAZARD':'SURVIVING'));
+      label = name===commitDir ? 'EXCURSION' : (name===cyc ? 'PATROL' : (hazards.length?'WAITING OUT HAZARD':'SURVIVING'));
     }
     if(value>bestVal){ bestVal=value; best=name; bestLabel=label; }
   }
