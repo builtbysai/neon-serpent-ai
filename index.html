@@ -574,28 +574,26 @@ window.__ns={ get mode(){return mode}, get score(){return score}, get best(){ret
 /* Neon Serpent AI — plays the shipped game through its own input.
    Every decision goes through window.__ns.setDir(), the exact function a
    swipe calls. The AI never touches positions, scores, or internals.
-   v4 brain — go for 118 (the board-fill ceiling):
-   - The Hamiltonian cycle is the safe home base (v2 proved it: best
-     69). The AI patrols it by default.
-   - EXCURSION: when food sits off the cycle, the AI plans a round
-     trip — cycle to food and back to the cycle — and only takes it
-     when the whole trip simulates safe with moving bodies. This eats
-     off-cycle food without abandoning the cycle for good, which is
-     how the score gets past the cycle-confined cap of ~74. A direct
-     food chase with no return (v3) was tried and died at 46.
-   - REJOIN: when a hazard forces the snakes off the cycle, a joint
-     BFS path back to the nearest cycle cell (verified step by step)
-     is followed through.
-   - Every committed path is verified with moving bodies before it is
-     followed. When no committed path exists, a one-step planner
-     scores each legal move by food distance, free space, and tail
-     safety, with the cycle move winning whenever it is legal. */
+   v7 brain:
+   - The snakes are one linked walk: magenta is always M(c)=(12-x,y+6) of
+     cyan, so cyan's body must never meet M(body). That caps cyan's body at
+     91 cells (score 88) no matter what; the largest conflict-free cycle that
+     keeps every food pair reachable is 84 cells (solver-proven optimal), so
+     the AI patrols an 84-cell Hamiltonian cycle (best layout picked by
+     headless trials over many solver-generated 84-cycles).
+   - When a hazard sits on the cycle, a depth-first search with cycle-first
+     move ordering finds a survive-and-rejoin detour (it can leave the cycle
+     anywhere on the board); a layered BFS is the fallback. Every plan is
+     re-simulated with moving bodies each tick and dropped if it goes illegal.
+   - Food the cycle can never reach gets a verified round-trip excursion.
+   - If the head is off the cycle with no hazard and no route home, the old
+     greedy planner (flood-fill + tail-reachability) takes over. */
 const AI = {
   paused: false, runs: 0, sessionBest: 0,
   allBest: parseInt(localStorage.getItem('nsai_best')||'0',10),
   strategy: 'STARTING', grow: 0, lastScore: 0,
   lastHeads: '', lastMode: 'menu', lastSplit: false,
-  ticksSinceEat: 0, committedPath: null, restartTimer: null,
+  ticksSinceEat: 0, committedPath: null, plan: null, restartTimer: null, stepMs: 0, lastStepT: 0,
 };
 const AI_DIRS = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
 const AI_NAMES = ['up','down','left','right'];
@@ -608,7 +606,7 @@ function aiState(){
   return { ns: ns, mode: ns.mode, score: ns.score,
     snakes: ns.snakes.map(s=>({ dir:{x:s.dir.x,y:s.dir.y}, body:s.body.map(c=>({x:c.x,y:c.y})) })),
     foods: ns.foods.map(f=>({x:f.x,y:f.y})),
-    hazards: ns.hazards.map(h=>({x:h.x,y:h.y})),
+    hazards: ns.hazards.map(h=>({x:h.x,y:h.y,life:h.life})),
     COLS: ns.COLS, ROWS: ns.ROWS, split: ns.splitDone };
 }
 function aiBFS(sx, sy, blocked, targets, COLS, ROWS){
@@ -660,19 +658,8 @@ function aiFlood(sx, sy, blocked, COLS, ROWS){
 // Verified offline: 78 unique cells, closed, all food rows edible, both
 // split start cells on the paths at the same phase.
 const AI_CYCLE = (function(){
-  const cells = [];
-  for(let y=0;y<13;y++) cells.push([0,y]);
-  cells.push([1,12]);
-  for(let y=11;y>=1;y--) cells.push([1,y]);
-  cells.push([2,1]);
-  for(let y=2;y<13;y++) cells.push([2,y]);
-  cells.push([3,12]);
-  for(let y=11;y>=1;y--) cells.push([3,y]);
-  cells.push([4,1]);
-  for(let y=2;y<13;y++) cells.push([4,y]);
-  cells.push([5,12]);
-  for(let y=11;y>=0;y--) cells.push([5,y]);
-  for(let x=4;x>=1;x--) cells.push([x,0]);
+  // 84-cell conflict-free cycle (CP-SAT optimum with every food pair coverable)
+  const cells = [[0,6],[1,6],[2,6],[3,6],[4,6],[4,5],[3,5],[2,5],[2,4],[2,3],[2,2],[1,2],[1,3],[1,4],[1,5],[0,5],[0,4],[0,3],[0,2],[0,1],[0,0],[1,0],[1,1],[2,1],[2,0],[3,0],[3,1],[3,2],[4,2],[5,2],[5,1],[4,1],[4,0],[5,0],[6,0],[6,1],[6,2],[6,3],[5,3],[4,3],[3,3],[3,4],[4,4],[5,4],[6,4],[6,5],[5,5],[5,6],[5,7],[5,8],[4,8],[4,7],[3,7],[3,8],[3,9],[3,10],[4,10],[4,9],[5,9],[5,10],[5,11],[5,12],[4,12],[4,11],[3,11],[3,12],[2,12],[1,12],[0,12],[0,11],[0,10],[1,10],[1,11],[2,11],[2,10],[2,9],[1,9],[0,9],[0,8],[1,8],[2,8],[2,7],[1,7],[0,7]];
   const next = new Map();
   for(let i=0;i<cells.length;i++){
     const a=cells[i], b=cells[(i+1)%cells.length];
@@ -790,6 +777,215 @@ function aiSimulatePath(dirs, st){
   }
   return true;
 }
+
+// ---------- v7 planner: whole-board time-expanded search around the cycle ----------
+// The linked system is one cyan walk: magenta's cell is always M(c)=(12-x,y+6),
+// so only cyan's body is tracked. Cyan head c is legal iff c, M(c) and M^-1(c)
+// avoid cyan's body (tail vacating unless growing) and no hazard covers c or M(c).
+// Normal play is a cycle patrol. When patrolling would die within a hazard's
+// remaining life, a layered BFS over (cell, time) finds the shortest detour
+// anywhere on the board that survives and then lands back on the cycle with a
+// verified clean run ahead. The same search plans safe round trips to food
+// the cycle can never reach.
+const AI_ID = (x,y)=>y*13+x;
+const AI_MID = new Int16Array(247).fill(-1), AI_MINV = new Int16Array(247).fill(-1);
+for(let y=0;y<19;y++) for(let x=0;x<13;x++){
+  if(y<=12) AI_MID[AI_ID(x,y)] = AI_ID(12-x,y+6);
+  if(y>=6) AI_MINV[AI_ID(x,y)] = AI_ID(12-x,y-6);
+}
+const AI_IDX = new Int16Array(247).fill(-1), AI_SUCC = new Int16Array(247).fill(-1);
+AI_CYCLE_KEYS.forEach((k,i)=>{ const p=k.split(','); AI_IDX[AI_ID(+p[0],+p[1])]=i; });
+AI_CYCLE_KEYS.forEach((k,i)=>{ const p=k.split(','), q=AI_CYCLE_KEYS[(i+1)%AI_CYCLE_LEN].split(',');
+  AI_SUCC[AI_ID(+p[0],+p[1])]=AI_ID(+q[0],+q[1]); });
+const AI_NB = [];
+for(let id=0;id<247;id++){ const x=id%13, y=(id/13)|0, out=[];
+  if(y<=12) for(const d of AI_NEIGH){ const nx=x+d.x, ny=y+d.y; if(nx>=0&&nx<13&&ny>=0&&ny<=12) out.push(AI_ID(nx,ny)); }
+  AI_NB.push(out); }
+function aiDirOf(from,to){
+  const dx=(to%13)-(from%13), dy=((to/13)|0)-((from/13)|0);
+  return dx===1?'right':dx===-1?'left':dy===-1?'up':'down';
+}
+// does following the cycle from this body stay legal for K steps?
+function aiCycleOK(body, grow, t0, K, X){
+  const L=body.length; if(AI_IDX[body[0]]<0) return false;
+  const occ=new Uint8Array(247), ring=new Int16Array(256);
+  for(let k=0;k<L;k++){ ring[(255-k)&255]=body[k]; occ[body[k]]=1; }
+  let hd=255, len=L, g=grow, h=body[0];
+  const taken=[0,0,0,0];
+  for(let s=0;s<K;s++){
+    const p=AI_SUCC[h];
+    if(t0+s < X.blockUntil[p]) return false;
+    const mp=AI_MID[p], mi=AI_MINV[p];
+    if(mp<0) return false;
+    if(g===0){ occ[ring[(hd-len+1)&255]]=0; }
+    if(occ[p]||occ[mp]||(mi>=0&&occ[mi])) return false;
+    hd=(hd+1)&255; ring[hd]=p; occ[p]=1;
+    if(g>0){ g--; len++; }
+    const fi=X.foodAt[p]; if(fi>=0 && !taken[fi]){ taken[fi]=1; g++; }
+    h=p;
+  }
+  return true;
+}
+function aiExpand(S, p, t, X){
+  if(t < X.blockUntil[p]) return null;
+  const mp=AI_MID[p], mi=AI_MINV[p]; if(mp<0) return null;
+  const body=S.body, L=body.length, lim=S.grow>0?L:L-1;
+  for(let k=0;k<lim;k++){ const c=body[k]; if(c===p||c===mp||c===mi) return null; }
+  const nb=new Array(S.grow>0?L+1:L); nb[0]=p;
+  for(let k=1;k<nb.length;k++) nb[k]=body[k-1];
+  let g=S.grow>0?S.grow-1:0, ate=S.ate;
+  const fi=X.foodAt[p]; if(fi>=0){ g++; ate=true; }
+  return {body:nb, grow:g, ate:ate, parent:S, move:aiDirOf(body[0],p)};
+}
+function aiMakeCtx(st){
+  const blockUntil=new Int16Array(247), foodAt=new Int8Array(247).fill(-1);
+  const stepMs = Math.max(20, AI.stepMs||100);
+  let maxRem=0;
+  for(const h of st.hazards){
+    const rem=Math.ceil(h.life*1000/stepMs)+1; if(rem>maxRem) maxRem=rem;
+    const hc=AI_ID(h.x,h.y);
+    if(h.y<=12 && blockUntil[hc]<rem) blockUntil[hc]=rem;
+    const mi=AI_MINV[hc]; if(mi>=0 && blockUntil[mi]<rem) blockUntil[mi]=rem;
+  }
+  st.foods.forEach((f,i)=>{ const fc=AI_ID(f.x,f.y); if(f.y<=12) foodAt[fc]=i; const mi=AI_MINV[fc]; if(mi>=0) foodAt[mi]=i; });
+  return {blockUntil, foodAt, maxRem};
+}
+// layered BFS over (head cell, time). Returns {moves, goal} or null.
+function aiSearch(st, X, needEat, Hmax, budget){
+  const root={body:st.snakes[0].body.map(c=>AI_ID(c.x,c.y)), grow:AI.grow, ate:false, parent:null, move:null};
+  const cur0=st.snakes[0].dir;
+  const rootRev = AI_ID(root.body[0]%13 - cur0.x, ((root.body[0]/13)|0) - cur0.y);
+  const seen=new Set(); let layer=[root], deepest=root;
+  for(let t=0;t<Hmax;t++){
+    const next=[];
+    for(const S of layer){
+      const hdc=S.body[0];
+      for(const p of AI_NB[hdc]){
+        if(t===0 && p===rootRev) continue;
+        const key=((p*2+(S.ate?1:0))*256)+t;
+        if(seen.has(key)) continue;
+        if(--budget<0) return needEat ? null : aiPlanFrom(deepest);
+        const ns=aiExpand(S,p,t,X); if(!ns) continue;
+        seen.add(key);
+        if((!needEat||ns.ate) && AI_IDX[p]>=0 &&
+           aiCycleOK(ns.body, ns.grow, t+1, Math.max(0,X.maxRem-(t+1))+30, X)) return aiPlanFrom(ns,true);
+        next.push(ns);
+      }
+    }
+    if(!next.length) break;
+    layer=next; deepest=next[0];
+  }
+  return needEat ? null : aiPlanFrom(deepest);
+}
+function aiPlanFrom(S, goal){
+  const moves=[]; for(let n=S;n&&n.parent;n=n.parent) moves.unshift(n.move);
+  return {moves, goal:!!goal};
+}
+function aiPlanValid(moves, st, X){
+  let S={body:st.snakes[0].body.map(c=>AI_ID(c.x,c.y)), grow:AI.grow, ate:false};
+  for(let t=0;t<moves.length;t++){
+    const hd=S.body[0], d=AI_DIRS[moves[t]];
+    const nx=(hd%13)+d.x, ny=((hd/13)|0)+d.y;
+    if(nx<0||nx>12||ny<0||ny>12) return false;
+    S=aiExpand(S,AI_ID(nx,ny),t,X); if(!S) return false;
+  }
+  return true;
+}
+
+// Depth-first survive-and-rejoin search with cycle-first move ordering. Walks the
+// cycle (and forward chords) when it can, deviates only when it must, and
+// succeeds once every hazard has expired and the head sits on the cycle with a
+// clean run ahead. Node-capped; returns {moves, goal} (deepest path when capped).
+function aiDfsPlan(st, X, nodeCap){
+  const body0=st.snakes[0].body.map(c=>AI_ID(c.x,c.y));
+  const cur0=st.snakes[0].dir;
+  const rev=AI_ID(body0[0]%13 - cur0.x, ((body0[0]/13)|0) - cur0.y);
+  const ring=new Int16Array(1024), occ=new Uint8Array(247), path=new Int16Array(800);
+  const L0=body0.length;
+  for(let k=0;k<L0;k++){ ring[(1023-k)&1023]=body0[k]; occ[body0[k]]=1; }
+  let hd=1023, len=L0, nodes=0, bestT=-1, bestPath=null, succT=-1;
+  const taken=[0,0,0,0];
+  const T_END = Math.min(X.maxRem, 600);          // hazards are gone at this time
+  const T_MAX = T_END + 70;
+  function cycleOKNow(g,t){
+    const bodyArr=new Array(len); for(let k=0;k<len;k++) bodyArr[k]=ring[(hd-k)&1023];
+    return aiCycleOK(bodyArr, g, t, 30, X);
+  }
+  function dfs(t,g){
+    if(t>=T_END && AI_IDX[ring[hd&1023]]>=0 && cycleOKNow(g,t)){ succT=t; return true; }
+    if(t>=T_MAX) return false;
+    if(++nodes>nodeCap) return false;
+    if(t>bestT){ bestT=t; bestPath=Array.prototype.slice.call(path,0,t); }
+    const h=ring[hd&1023], nbs=AI_NB[h], succ=AI_SUCC[h];
+    // order: cycle successor, other cycle cells by forward jump, then the rest
+    const cand=[]; 
+    for(let i=0;i<nbs.length;i++){ const p=nbs[i];
+      if(t===0 && p===rev) continue;
+      let pr = p===succ ? 0 : (AI_IDX[p]>=0 && AI_IDX[h]>=0 ? 1+((AI_IDX[p]-AI_IDX[h]+AI_CYCLE_LEN)%AI_CYCLE_LEN)/1000 : (AI_IDX[p]>=0?1.5:2));
+      cand.push([pr,p]); }
+    cand.sort((a,b)=>a[0]-b[0]);
+    for(let ci=0;ci<cand.length;ci++){
+      const p=cand[ci][1];
+      if(t<X.blockUntil[p]) continue;
+      const mp=AI_MID[p], mi=AI_MINV[p]; if(mp<0) continue;
+      let tail=-1;
+      if(g===0){ tail=ring[(hd-len+1)&1023]; occ[tail]=0; }
+      if(occ[p]||occ[mp]||(mi>=0&&occ[mi])){ if(tail>=0) occ[tail]=1; continue; }
+      hd=(hd+1)&1023; ring[hd]=p; occ[p]=1; path[t]=p;
+      let g2=g>0?g-1:0, len2=len; if(g>0) len++; 
+      const fi=X.foodAt[p]; let ate=false; if(fi>=0 && !taken[fi]){ taken[fi]=1; g2++; ate=true; }
+      const ok=dfs(t+1,g2);
+      if(ate) taken[X.foodAt[p]]=0;
+      len=len2; occ[p]=0; hd=(hd-1)&1023;
+      if(tail>=0) occ[tail]=1;
+      if(ok) return true;
+      if(nodes>nodeCap) return false;
+    }
+    return false;
+  }
+  const ok=dfs(0,AI.grow);
+  const cells = ok ? Array.prototype.slice.call(path,0,succT) : bestPath;
+  const moves=[]; let prev=body0[0];
+  for(const p of (cells||[])){ moves.push(aiDirOf(prev,p)); prev=p; }
+  return {ok, nodes, moves, goal:ok};
+}
+
+function aiNextMove(st){
+  if(st.snakes.length!==2) return null;
+  const X=aiMakeCtx(st);
+  const body=st.snakes[0].body.map(c=>AI_ID(c.x,c.y));
+  // 1. follow a cached plan while it still simulates legal
+  if(AI.plan && AI.plan.moves.length){
+    if(aiPlanValid(AI.plan.moves, st, X)){ const m=AI.plan.moves.shift(); AI.strategy=AI.plan.label; return m; }
+    AI.plan=null;
+  }
+  // 2. plain patrol when the cycle ahead is clean (K covers every hazard's life)
+  const onCyc = AI_IDX[body[0]]>=0;
+  const patrolOK = onCyc && aiCycleOK(body, AI.grow, 0, X.maxRem+30, X);
+  // 3. food the cycle can never reach: plan a verified round trip
+  let wantTrip=false;
+  if(patrolOK && st.foods.length){
+    wantTrip = !st.foods.some(f=>{ const fc=AI_ID(f.x,f.y); const mi=AI_MINV[fc];
+      return (f.y<=12 && AI_IDX[fc]>=0) || (mi>=0 && AI_IDX[mi]>=0); });
+  }
+  if(patrolOK && !wantTrip){ AI.strategy='PATROL'; return aiDirOf(body[0], AI_SUCC[body[0]]); }
+  let plan=null;
+  if(wantTrip){
+    plan=aiSearch(st, X, true, 70, 40000);
+    if(plan && plan.goal && plan.moves.length){ plan.label='EXCURSION'; }
+    else plan=null;
+    if(!plan){ AI.strategy='PATROL'; return aiDirOf(body[0], AI_SUCC[body[0]]); }
+  } else {
+    plan=aiDfsPlan(st, X, 150000);
+    if(!plan.goal){ const alt=aiSearch(st, X, false, Math.max(40, X.maxRem+12), 60000); if(alt && alt.goal) plan=alt; else if(!(plan.moves&&plan.moves.length)) plan=alt; }
+    if(plan && !plan.goal && X.maxRem===0) plan=null; // no hazard and no way home: let the greedy planner hunt
+    if(plan && plan.moves.length) plan.label = plan.goal ? 'DETOUR' : 'SURVIVING';
+    else plan=null;
+  }
+  if(!plan) return null;
+  AI.plan=plan; const m=plan.moves.shift(); AI.strategy=plan.label; return m;
+}
+
 function aiDecide(){
   const st = aiState(); if(!st || st.mode!=='play' || AI.paused) return;
   const COLS=st.COLS, ROWS=st.ROWS, snakes=st.snakes, foods=st.foods, hazards=st.hazards;
@@ -802,6 +998,18 @@ function aiDecide(){
     for(let i=0;i<lim;i++) curBlocked.add(aiKey(s.body[i].x, s.body[i].y));
   });
   hazards.forEach(h=>curBlocked.add(aiKey(h.x,h.y)));
+  if(split){
+    const nm = aiNextMove(st);
+    if(nm){
+      window.__ns.setDir(nm);
+      window.__AI_DEBUG = window.__AI_DEBUG || { decisions: [], deaths: [] };
+      window.__AI_DEBUG.decisions.push({ score: st.score, grow: AI.grow, dir: nm, heads: st.snakes.map(s=>({x:s.body[0].x,y:s.body[0].y})),
+        dirs: st.snakes.map(s=>({x:s.dir.x,y:s.dir.y})), foods: st.foods, hazards: st.hazards.length, label: AI.strategy });
+      if(window.__AI_DEBUG.decisions.length>40) window.__AI_DEBUG.decisions.shift();
+      AI.committedPath = null;
+      return;
+    }
+  }
   const cycleCells = AI_CYCLE_KEYS.map(k=>{ const p=k.split(','); return {x:+p[0], y:+p[1]}; });
   let commitDir=null;
   // Committed paths: follow the plan through instead of replanning
@@ -896,7 +1104,7 @@ function aiDecide(){
     // plan is dropped.
     const commitBonus = (name===commitDir) ? 40000 : 0;
     // Prefer landing back on the cycle after a detour, so the patrol resumes.
-    const rejoinBonus = AI_CYCLE.has(aiKey(nh[0].x, nh[0].y)) ? 5000 : 0;
+    const rejoinBonus = (split && AI_CYCLE.has(aiKey(nh[0].x, nh[0].y))) ? 5000 : 0;
     if(hasPath){
       value = commitBonus + cycleBonus + rejoinBonus + (safe?10000:0) + 5000 - dMin*10 + minSpace + (eats?500:0) + (name===(cur.x===1?'right':cur.x===-1?'left':cur.y===-1?'up':'down')?1:0);
       label = name===commitDir ? 'EXCURSION' : (name===cyc ? 'PATROL' : (eats?'HUNTING — EATING':'HUNTING'));
@@ -945,7 +1153,7 @@ function aiRunOver(){
 function aiPoll(){
   const st = aiState(); if(!st) return;
   if(st.mode==='play' && AI.lastMode!=='play'){
-    AI.grow=0; AI.lastScore=0; AI.lastHeads=''; AI.lastSplit=false; AI.ticksSinceEat=0;
+    AI.grow=0; AI.lastScore=0; AI.lastHeads=''; AI.lastSplit=false; AI.ticksSinceEat=0; AI.plan=null;
   }
   // Normal speed only: the game's own loop steps, the poll decides once
   // after each observed step.
@@ -954,6 +1162,7 @@ function aiPoll(){
     if(heads!==AI.lastHeads){
       if(st.split && !AI.lastSplit) AI.grow=0;
       else { const ate = st.score > AI.lastScore; AI.grow = Math.max(0, AI.grow-1) + (ate?1:0); }
+      { const nowT = performance.now(); if(AI.lastStepT){ const dt=Math.min(300,Math.max(15,nowT-AI.lastStepT)); AI.stepMs = AI.stepMs ? AI.stepMs*0.7+dt*0.3 : dt; } AI.lastStepT = nowT; }
       if(st.score > AI.lastScore) AI.ticksSinceEat=0; else AI.ticksSinceEat++;
       AI.lastScore = st.score; AI.lastHeads = heads; AI.lastSplit = st.split;
       aiDecide();
