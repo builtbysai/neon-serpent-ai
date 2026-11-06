@@ -128,7 +128,9 @@ function spawnFoodPair(){
   // (The old version tried 60 random cells, then fell back to two unmirrored
   // corner cells with no `ph` field: the NaN pulse made them invisible and
   // they were out of reach, so play stalled around score 79.)
-  const tiers=[ {x0:1,x1:5,y0:1,y1:ROWS-2,near:3}, {x0:0,x1:5,y0:0,y1:ROWS-1,near:3}, {x0:0,x1:5,y0:0,y1:ROWS-1,near:0} ];
+  const tiers=[ {x0:0,x1:5,y0:0,y1:ROWS-1,near:3}, {x0:0,x1:5,y0:0,y1:ROWS-1,near:0} ];
+  const tdist=(ax,ay,bx,by)=>{ const dx=Math.abs(ax-bx), dy=Math.abs(ay-by);
+    return Math.min(dx,COLS-dx)+Math.min(dy,ROWS-dy); }; // distance on the torus
   for(const T of tiers){
     const cand=[];
     for(let y=T.y0;y<=T.y1;y++) for(let x=T.x0;x<=T.x1;x++){
@@ -136,7 +138,7 @@ function spawnFoodPair(){
       if(x===mx || occupied(x,y)||occupied(mx,y)) continue;
       let near=false;
       for(const s of snakes){ const h=s.body[0];
-        if(Math.abs(h.x-x)+Math.abs(h.y-y)<T.near || Math.abs(h.x-mx)+Math.abs(h.y-y)<T.near){ near=true; break; } }
+        if(tdist(h.x,h.y,x,y)<T.near || tdist(h.x,h.y,mx,y)<T.near){ near=true; break; } }
       if(!near) cand.push({x:x,y:y});
     }
     if(cand.length){
@@ -231,12 +233,10 @@ function step(){
   const newHeads=[];
   for(const s of snakes){
     s.prev=s.body.map(seg=>({x:seg.x,y:seg.y}));
-    newHeads.push({x:s.body[0].x+s.dir.x, y:s.body[0].y+s.dir.y});
-  }
-  // wall death
-  for(let i=0;i<snakes.length;i++){
-    const nh=newHeads[i];
-    if(!inBounds(nh.x,nh.y)){ die('wall'); return; }
+    // torus: off any edge a head comes out on the opposite edge (no wall death).
+    // The mirror link M(c)=(12-x,(y+6) mod 19) holds because both heads move by
+    // (dx,dy) / (-dx,dy) modulo the board.
+    newHeads.push({x:(s.body[0].x+s.dir.x+COLS)%COLS, y:(s.body[0].y+s.dir.y+ROWS)%ROWS});
   }
   // head-on: both heads into the same cell
   if(snakes.length===2 && newHeads[0].x===newHeads[1].x && newHeads[0].y===newHeads[1].y){ die('head-on'); return; }
@@ -385,16 +385,36 @@ function tickProgress(){
   if(splitPause>0) return 1;
   return Math.min(1, tickAcc/tickMs);
 }
+function wrapDelta(a,b,n){ let d=b-a; if(d>n/2) d-=n; else if(d<-n/2) d+=n; return d; }
 function interpPos(s,i){
   const cur=s.body[i], prev=s.prev[Math.min(i,s.prev.length-1)]||cur;
   const t=tickProgress();
-  return { x:lerp(prev.x,cur.x,t), y:lerp(prev.y,cur.y,t) };
+  // shortest way across the seam, so a segment crossing an edge slides over it
+  return { x:prev.x+wrapDelta(prev.x,cur.x,COLS)*t, y:prev.y+wrapDelta(prev.y,cur.y,ROWS)*t };
 }
 function drawSnake(s){
   const n=s.body.length;
-  const pts=[];
-  for(let i=0;i<n;i++){ const p=interpPos(s,i); pts.push({x:cellCX(p.x), y:cellCY(p.y)}); }
+  const raw=[];
+  for(let i=0;i<n;i++){ raw.push(interpPos(s,i)); }
+  // unwrap into one continuous path (each segment placed by its shortest delta from the one before)
+  const pts=[]; let ux=raw[0].x, uy=raw[0].y; pts.push({x:cellCX(ux), y:cellCY(uy)});
+  for(let i=1;i<n;i++){ ux+=wrapDelta(raw[i-1].x,raw[i].x,COLS); uy+=wrapDelta(raw[i-1].y,raw[i].y,ROWS);
+    pts.push({x:cellCX(ux), y:cellCY(uy)}); }
   if(pts.length<2) return;
+  // draw the path at the 3x3 wrapped offsets, clipped to the field: the part that leaves one edge shows on the other
+  ctx.save();
+  ctx.beginPath(); ctx.rect(GX,FY,COLS*CELL,FH); ctx.clip();
+  for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
+    let inView=false;
+    for(const p of pts){ const px=p.x+ox*COLS*CELL, py=p.y+oy*FH;
+      if(px>GX-CELL && px<GX+COLS*CELL+CELL && py>FY-CELL && py<FY+FH+CELL){ inView=true; break; } }
+    if(!inView) continue;
+    drawSnakePath(s, pts.map(p=>({x:p.x+ox*COLS*CELL, y:p.y+oy*FH})));
+  }
+  ctx.restore();
+}
+function drawSnakePath(s,pts){
+  const n=pts.length;
   ctx.save();
   ctx.lineCap='round'; ctx.lineJoin='round';
   // glow pass
@@ -570,7 +590,8 @@ window.__ns={ get mode(){return mode}, get score(){return score}, get best(){ret
   placeFood(x,y){ foods=[{x:x,y:y,ph:0},{x:COLS-1-x,y:y,ph:0}]; },
   placeFoodAhead(){ const s=snakes[0], h=s.body[0];
     const fx=h.x+s.dir.x, fy=h.y+s.dir.y;
-    if(inBounds(fx,fy)){ foods=[{x:fx,y:fy,ph:0},{x:COLS-1-fx,y:fy,ph:0}]; return true; } return false; },
+    const wx=(fx+COLS)%COLS, wy=(fy+ROWS)%ROWS;
+    foods=[{x:wx,y:wy,ph:0},{x:COLS-1-wx,y:wy,ph:0}]; return true; },
   stepNow(){ step(); },
   setScore(n){ score=n; } };
 </script>
@@ -603,7 +624,13 @@ window.__ns={ get mode(){return mode}, get score(){return score}, get best(){ret
    - Every free route is only taken if a proven way HOME exists from where it
      ends (aiHomeProof), hazards simulated in time; when the cycle is not
      clean ahead it is not an option at all and the AI goes straight.
-   v7 brain:
+   v9 TORUS: the board wraps (left<->right, top<->bottom). The mirror is
+   M(c)=(12-x,(y+6) mod 19); cyan may now use all 13x19 cells. Cycle, home
+   proof, risk flood fill, A* heuristic and every neighbour/bounds check
+   are toroidal. The conflict-free cap is the independent-set bound of M on
+   the torus (123 cells, score 120); the best patrol cycle is 121 cells
+   (CP-SAT optimal), so a patrolling AI tops out at score 118.
+   v7 brain (flat-board numbers below are historical):
    - The snakes are one linked walk: magenta is always M(c)=(12-x,y+6) of
      cyan, so cyan's body must never meet M(body). That caps cyan's body at
      91 cells (score 88) no matter what; the largest conflict-free cycle that
@@ -628,6 +655,9 @@ const AI_DIRS = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0
 const AI_NAMES = ['up','down','left','right'];
 const AI_NEIGH = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
 function aiMirror(d){ return {x:-d.x, y:d.y}; }
+const AI_C=13, AI_R=19, AI_N=247;
+function aiWX(x){ return (x%13+13)%13; }
+function aiWY(y){ return (y%19+19)%19; }
 function aiKey(x,y){ return x+','+y; }
 
 function aiState(){
@@ -647,8 +677,7 @@ function aiBFS(sx, sy, blocked, targets, COLS, ROWS){
     d++; const next = [];
     for(const cell of frontier){
       for(const dd of AI_NEIGH){
-        const nx=cell[0]+dd.x, ny=cell[1]+dd.y;
-        if(nx<0||nx>=COLS||ny<0||ny>=ROWS) continue;
+        const nx=(cell[0]+dd.x+COLS)%COLS, ny=(cell[1]+dd.y+ROWS)%ROWS;
         const k=aiKey(nx,ny);
         if(seen.has(k)||blocked.has(k)) continue;
         if(tset.has(k)) return d;
@@ -667,8 +696,7 @@ function aiFlood(sx, sy, blocked, COLS, ROWS){
     for(const cell of frontier){
       count++;
       for(const dd of AI_NEIGH){
-        const nx=cell[0]+dd.x, ny=cell[1]+dd.y;
-        if(nx<0||nx>=COLS||ny<0||ny>=ROWS) continue;
+        const nx=(cell[0]+dd.x+COLS)%COLS, ny=(cell[1]+dd.y+ROWS)%ROWS;
         const k=aiKey(nx,ny);
         if(seen.has(k)||blocked.has(k)) continue;
         seen.add(k); next.push([nx,ny]);
@@ -688,11 +716,14 @@ function aiFlood(sx, sy, blocked, COLS, ROWS){
 // split start cells on the paths at the same phase.
 const AI_CYCLE = (function(){
   // 84-cell conflict-free cycle (CP-SAT optimum with every food pair coverable)
-  const cells = [[0,6],[1,6],[2,6],[3,6],[4,6],[4,5],[3,5],[2,5],[2,4],[2,3],[2,2],[1,2],[1,3],[1,4],[1,5],[0,5],[0,4],[0,3],[0,2],[0,1],[0,0],[1,0],[1,1],[2,1],[2,0],[3,0],[3,1],[3,2],[4,2],[5,2],[5,1],[4,1],[4,0],[5,0],[6,0],[6,1],[6,2],[6,3],[5,3],[4,3],[3,3],[3,4],[4,4],[5,4],[6,4],[6,5],[5,5],[5,6],[5,7],[5,8],[4,8],[4,7],[3,7],[3,8],[3,9],[3,10],[4,10],[4,9],[5,9],[5,10],[5,11],[5,12],[4,12],[4,11],[3,11],[3,12],[2,12],[1,12],[0,12],[0,11],[0,10],[1,10],[1,11],[2,11],[2,10],[2,9],[1,9],[0,9],[0,8],[1,8],[2,8],[2,7],[1,7],[0,7]];
+  // 121-cell conflict-free TORUS cycle (CP-SAT optimum: every food pair coverable, start body anchored)
+  const cells = [[0,6],[1,6],[2,6],[3,6],[4,6],[5,6],[5,5],[4,5],[4,4],[5,4],[6,4],[6,3],[5,3],[4,3],[4,2],[5,2],[5,1],[5,0],[5,18],[4,18],[4,17],[5,17],[5,16],[4,16],[4,15],[3,15],[2,15],[1,15],[1,16],[2,16],[3,16],[3,17],[2,17],[1,17],[1,18],[1,0],[2,0],[2,18],[3,18],[3,0],[4,0],[4,1],[3,1],[3,2],[3,3],[2,3],[1,3],[1,4],[2,4],[3,4],[3,5],[2,5],[1,5],[0,5],[0,4],[0,3],[0,2],[1,2],[2,2],[2,1],[1,1],[0,1],[0,0],[0,18],[0,17],[0,16],[0,15],[0,14],[0,13],[0,12],[0,11],[1,11],[1,12],[1,13],[1,14],[2,14],[3,14],[4,14],[4,13],[5,13],[5,14],[5,15],[6,15],[6,14],[6,13],[6,12],[6,11],[5,11],[5,12],[4,12],[4,11],[3,11],[3,12],[3,13],[2,13],[2,12],[2,11],[2,10],[1,10],[0,10],[0,9],[1,9],[2,9],[2,8],[3,8],[4,8],[4,9],[3,9],[3,10],[4,10],[5,10],[5,9],[5,8],[5,7],[4,7],[3,7],[2,7],[1,7],[1,8],[0,8],[0,7]];
   const next = new Map();
   for(let i=0;i<cells.length;i++){
     const a=cells[i], b=cells[(i+1)%cells.length];
-    next.set(a[0]+','+a[1], {x:b[0]-a[0], y:b[1]-a[1]});
+    let dx=b[0]-a[0], dy=b[1]-a[1];
+    if(dx>6) dx-=13; else if(dx<-6) dx+=13; if(dy>9) dy-=19; else if(dy<-9) dy+=19; // seam steps
+    next.set(a[0]+','+a[1], {x:dx, y:dy});
   }
   return next; // key "x,y" -> {x:dx, y:dy} to the next cycle cell
 })();
@@ -735,14 +766,12 @@ function aiPath(sx, sy, blocked, targets, COLS, ROWS, curDir){
     const next=[];
     for(const cell of frontier){
       const cx=cell[0], cy=cell[1];
-      const mx=12-cx, my=cy+6; // magenta head for this cyan cell
+      const mx=12-cx, my=(cy+6)%19; // magenta head for this cyan cell (torus)
       for(const step of DIRS4){
         const nm=step[0], dx=step[1], dy=step[2];
         if(cx===sx && cy===sy && curDir && dx===-curDir.x && dy===-curDir.y) continue;
-        const nx=cx+dx, ny=cy+dy;
-        const nmx=mx-dx, nmy=my+dy; // magenta moves by mirror(d)
-        if(nx<0||nx>=COLS||ny<0||ny>=ROWS) continue;
-        if(nmx<0||nmx>=COLS||nmy<0||nmy>=ROWS) continue;
+        const nx=(cx+dx+COLS)%COLS, ny=(cy+dy+ROWS)%ROWS;
+        const nmx=(mx-dx+COLS)%COLS, nmy=(my+dy+ROWS)%ROWS; // magenta moves by mirror(d), wrapped
         const k=aiKey(nx,ny), km=aiKey(nmx,nmy);
         if(seen.has(k)||blocked.has(k)||blocked.has(km)) continue;
         seen.add(k);
@@ -774,8 +803,7 @@ function aiSimulatePath(dirs, st){
   for(const name of dirs){
     const d=AI_DIRS[name];
     const md = bodies.length===2 ? aiMirror(d) : null;
-    const nh = bodies.map((b,i)=>({x:b[0].x+(i===0?d.x:md.x), y:b[0].y+(i===0?d.y:md.y)}));
-    for(const h of nh) if(h.x<0||h.x>=COLS||h.y<0||h.y>=ROWS) return false;
+    const nh = bodies.map((b,i)=>({x:(b[0].x+(i===0?d.x:md.x)+COLS)%COLS, y:(b[0].y+(i===0?d.y:md.y)+ROWS)%ROWS}));
     if(bodies.length===2 && nh[0].x===nh[1].x && nh[0].y===nh[1].y) return false;
     for(const h of nh){
       if(haz.has(aiKey(h.x,h.y))) return false;
@@ -818,9 +846,9 @@ function aiSimulatePath(dirs, st){
 // the cycle can never reach.
 const AI_ID = (x,y)=>y*13+x;
 const AI_MID = new Int16Array(247).fill(-1), AI_MINV = new Int16Array(247).fill(-1);
-for(let y=0;y<19;y++) for(let x=0;x<13;x++){
-  if(y<=12) AI_MID[AI_ID(x,y)] = AI_ID(12-x,y+6);
-  if(y>=6) AI_MINV[AI_ID(x,y)] = AI_ID(12-x,y-6);
+for(let y=0;y<19;y++) for(let x=0;x<13;x++){   // torus: M and M^-1 exist for every cell
+  AI_MID[AI_ID(x,y)] = AI_ID(12-x,(y+6)%19);
+  AI_MINV[AI_ID(x,y)] = AI_ID(12-x,(y+13)%19);
 }
 const AI_IDX = new Int16Array(247).fill(-1), AI_SUCC = new Int16Array(247).fill(-1);
 AI_CYCLE_KEYS.forEach((k,i)=>{ const p=k.split(','); AI_IDX[AI_ID(+p[0],+p[1])]=i; });
@@ -828,12 +856,14 @@ AI_CYCLE_KEYS.forEach((k,i)=>{ const p=k.split(','), q=AI_CYCLE_KEYS[(i+1)%AI_CY
   AI_SUCC[AI_ID(+p[0],+p[1])]=AI_ID(+q[0],+q[1]); });
 const AI_NB = [];
 for(let id=0;id<247;id++){ const x=id%13, y=(id/13)|0, out=[];
-  if(y<=12) for(const d of AI_NEIGH){ const nx=x+d.x, ny=y+d.y; if(nx>=0&&nx<13&&ny>=0&&ny<=12) out.push(AI_ID(nx,ny)); }
+  for(const d of AI_NEIGH) out.push(AI_ID((x+d.x+13)%13,(y+d.y+19)%19));
   AI_NB.push(out); }
 function aiDirOf(from,to){
-  const dx=(to%13)-(from%13), dy=((to/13)|0)-((from/13)|0);
+  let dx=(to%13)-(from%13), dy=((to/13)|0)-((from/13)|0);
+  if(dx>6) dx-=13; else if(dx<-6) dx+=13; if(dy>9) dy-=19; else if(dy<-9) dy+=19; // seam steps
   return dx===1?'right':dx===-1?'left':dy===-1?'up':'down';
 }
+function aiStep(id,d){ return AI_ID(((id%13)+d.x+13)%13, (((id/13)|0)+d.y+19)%19); }
 // does following the cycle from this body stay legal for K steps?
 function aiCycleOK(body, grow, t0, K, X){
   const L=body.length; if(AI_IDX[body[0]]<0) return false;
@@ -873,17 +903,18 @@ function aiMakeCtx(st){
   for(const h of st.hazards){
     const rem=Math.ceil(h.life*1000/stepMs)+1; if(rem>maxRem) maxRem=rem;
     const hc=AI_ID(h.x,h.y);
-    if(h.y<=12 && blockUntil[hc]<rem) blockUntil[hc]=rem;
+    if(blockUntil[hc]<rem) blockUntil[hc]=rem;
     const mi=AI_MINV[hc]; if(mi>=0 && blockUntil[mi]<rem) blockUntil[mi]=rem;
   }
-  st.foods.forEach((f,i)=>{ const fc=AI_ID(f.x,f.y); if(f.y<=12) foodAt[fc]=i; const mi=AI_MINV[fc]; if(mi>=0) foodAt[mi]=i; });
+  st.foods.forEach((f,i)=>{ const fc=AI_ID(f.x,f.y); foodAt[fc]=i; const mi=AI_MINV[fc]; if(mi>=0) foodAt[mi]=i; });
   return {blockUntil, foodAt, maxRem};
 }
 // layered BFS over (head cell, time). Returns {moves, goal} or null.
 function aiSearch(st, X, needEat, Hmax, budget){
+  const tS=performance.now(); let tick=0;
   const root={body:st.snakes[0].body.map(c=>AI_ID(c.x,c.y)), grow:AI.grow, ate:false, parent:null, move:null};
   const cur0=st.snakes[0].dir;
-  const rootRev = AI_ID(root.body[0]%13 - cur0.x, ((root.body[0]/13)|0) - cur0.y);
+  const rootRev = aiStep(root.body[0], {x:-cur0.x, y:-cur0.y});
   const seen=new Set(); let layer=[root], deepest=root;
   for(let t=0;t<Hmax;t++){
     const next=[];
@@ -893,7 +924,7 @@ function aiSearch(st, X, needEat, Hmax, budget){
         if(t===0 && p===rootRev) continue;
         const key=((p*2+(S.ate?1:0))*256)+t;
         if(seen.has(key)) continue;
-        if(--budget<0) return needEat ? null : aiPlanFrom(deepest);
+        if(--budget<0 || (X.maxRem===0 && (++tick&255)===0 && performance.now()-tS>120)) return needEat ? null : aiPlanFrom(deepest); // wall-clock guard (real browser)
         const ns=aiExpand(S,p,t,X); if(!ns) continue;
         seen.add(key);
         if((!needEat||ns.ate) && AI_IDX[p]>=0 &&
@@ -914,9 +945,7 @@ function aiPlanValid(moves, st, X){
   let S={body:st.snakes[0].body.map(c=>AI_ID(c.x,c.y)), grow:AI.grow, ate:false};
   for(let t=0;t<moves.length;t++){
     const hd=S.body[0], d=AI_DIRS[moves[t]];
-    const nx=(hd%13)+d.x, ny=((hd/13)|0)+d.y;
-    if(nx<0||nx>12||ny<0||ny>12) return false;
-    S=aiExpand(S,AI_ID(nx,ny),t,X); if(!S) return false;
+    S=aiExpand(S,aiStep(hd,d),t,X); if(!S) return false;
   }
   return true;
 }
@@ -928,7 +957,7 @@ function aiPlanValid(moves, st, X){
 function aiDfsPlan(st, X, nodeCap){
   const body0=st.snakes[0].body.map(c=>AI_ID(c.x,c.y));
   const cur0=st.snakes[0].dir;
-  const rev=AI_ID(body0[0]%13 - cur0.x, ((body0[0]/13)|0) - cur0.y);
+  const rev=aiStep(body0[0], {x:-cur0.x, y:-cur0.y});
   const ring=new Int16Array(1024), occ=new Uint8Array(247), path=new Int16Array(800);
   const L0=body0.length;
   for(let k=0;k<L0;k++){ ring[(1023-k)&1023]=body0[k]; occ[body0[k]]=1; }
@@ -988,19 +1017,20 @@ function aiDfsPlan(st, X, nodeCap){
 // smooth, so the style slides from "go straight for the fruit" to "lean on
 // the cycle" with no switch.
 function aiSmooth(a,b,x){ const t=Math.max(0,Math.min(1,(x-a)/(b-a))); return t*t*(3-2*t); }
+const AI_RA=0.10, AI_RB=0.50; // fill range over which risk rises (fill = forbidden cells / 247)
 function aiRisk(st, X){
   const body=st.snakes[0].body.map(c=>AI_ID(c.x,c.y)), L=body.length;
   const F=new Uint8Array(247);
   for(const b of body){ F[b]=1; const m=AI_MID[b]; if(m>=0) F[m]=1; const mi=AI_MINV[b]; if(mi>=0) F[mi]=1; }
-  for(let c=0;c<169;c++) if(X.blockUntil[c]>0) F[c]=1;
-  let forb=0; for(let c=0;c<169;c++) if(F[c]) forb++;
+  for(let c=0;c<247;c++) if(X.blockUntil[c]>0) F[c]=1;
+  let forb=0; for(let c=0;c<247;c++) if(F[c]) forb++;
   // flood fill of legal cells from the head
   const seen=new Uint8Array(247), q=[body[0]]; seen[body[0]]=1; let space=0;
   for(let i=0;i<q.length;i++){ const c=q[i]; space++;
-    for(const p of AI_NB[c]) if(!seen[p] && !F[p] && AI_MID[p]>=0){ seen[p]=1; q.push(p); } }
-  const fill=forb/169;
+    for(const p of AI_NB[c]) if(!seen[p] && !F[p]){ seen[p]=1; q.push(p); } }
+  const fill=forb/247;
   const tight=Math.max(0, Math.min(1, 1 - space/(1.5*L+10)));
-  const r=Math.max(0, Math.min(1, aiSmooth(0.22,0.80,fill) + 0.3*tight + (st.hazards.length?0.10:0)));
+  const r=Math.max(0, Math.min(1, aiSmooth(AI_RA,AI_RB,fill) + 0.3*tight + (st.hazards.length?0.10:0)));
   return {r:r, fill:fill, space:space, tight:tight};
 }
 // Is there a way home from this state? "Home" = head on the cycle with the
@@ -1038,11 +1068,11 @@ const AI_NOFOOD = new Int8Array(247).fill(-1);
 // accepted only if a way home still exists from where it ends.
 function aiForage(st, X, rk){
   const S0={body:st.snakes[0].body.map(c=>AI_ID(c.x,c.y)), grow:AI.grow, ate:false, parent:null, move:null, g:0, t:0, dir:-1};
-  const cur0=st.snakes[0].dir, hx=S0.body[0]%13, hy=(S0.body[0]/13)|0;
-  const rootRev=AI_ID(hx-cur0.x, hy-cur0.y);
-  const tg=[]; for(let c=0;c<169;c++) if(X.foodAt[c]>=0) tg.push([c%13,(c/13)|0]);
+  const cur0=st.snakes[0].dir;
+  const rootRev=aiStep(S0.body[0], {x:-cur0.x, y:-cur0.y});
+  const tg=[]; for(let c=0;c<247;c++) if(X.foodAt[c]>=0) tg.push([c%13,(c/13)|0]);
   if(!tg.length) return null;
-  const H=c=>{ const x=c%13,y=(c/13)|0; let m=99; for(const q of tg){ const d=Math.abs(q[0]-x)+Math.abs(q[1]-y); if(d<m) m=d; } return m; };
+  const H=c=>{ const x=c%13,y=(c/13)|0; let m=99; for(const q of tg){ const ax=Math.abs(q[0]-x), ay=Math.abs(q[1]-y); const d=Math.min(ax,13-ax)+Math.min(ay,19-ay); if(d<m) m=d; } return m; }; // torus distance
   // Proofs assume every live hazard lasts 2 steps longer than the planner's own
   // estimate. Each later re-plan re-adds its own 1-step safety margin to a hazard
   // that has really aged, so a proof built with the same margin goes stale by one
@@ -1062,9 +1092,8 @@ function aiForage(st, X, rk){
     }
     if(S.t>=70) continue;
     for(let di=0;di<4;di++){
-      const d=AI_NEIGH[di], hd=S.body[0], nx=(hd%13)+d.x, ny=((hd/13)|0)+d.y;
-      if(nx<0||nx>12||ny<0||ny>12) continue;
-      const p=AI_ID(nx,ny);
+      const d=AI_NEIGH[di], hd=S.body[0];
+      const p=aiStep(hd,d);
       if(S.t===0 && p===rootRev) continue;
       const key=(p*4+di)*2+(S.ate?1:0); if(S.t>0 && seen.has(key)) continue;
       const ns=aiExpand(S,p,S.t,X); if(!ns) continue;
@@ -1081,9 +1110,10 @@ function aiForage(st, X, rk){
 function aiCycleCost(st, X){
   const hx=st.snakes[0].body[0].x, hy=st.snakes[0].body[0].y;
   let best=Infinity;
-  for(let c=0;c<169;c++){ if(X.foodAt[c]<0 || AI_IDX[c]<0) continue;
+  for(let c=0;c<247;c++){ if(X.foodAt[c]<0 || AI_IDX[c]<0) continue;
     for(let i=0;i<AI_CYCLE_LEN;i++){ const k=AI_CYCLE_KEYS[i], p=k.split(','); 
-      const walk=Math.abs(+p[0]-hx)+Math.abs(+p[1]-hy);
+      const ax=Math.abs(+p[0]-hx), ay=Math.abs(+p[1]-hy);
+      const walk=Math.min(ax,13-ax)+Math.min(ay,19-ay);
       const cd=(AI_IDX[c]-i+AI_CYCLE_LEN)%AI_CYCLE_LEN;
       if(walk+cd<best) best=walk+cd; } }
   return best;
@@ -1126,7 +1156,7 @@ function aiNextMove(st){
   let wantTrip=false;
   if(patrolOK && st.foods.length){
     wantTrip = !st.foods.some(f=>{ const fc=AI_ID(f.x,f.y); const mi=AI_MINV[fc];
-      return (f.y<=12 && AI_IDX[fc]>=0) || (mi>=0 && AI_IDX[mi]>=0); });
+      return AI_IDX[fc]>=0 || AI_IDX[mi]>=0; });
   }
   if(patrolOK && !wantTrip){ AI.strategy='PATROL'; return aiDirOf(body[0], AI_SUCC[body[0]]); }
   let plan=null;
@@ -1137,7 +1167,7 @@ function aiNextMove(st){
     else { if(!(AI.tCool>0 && AI.tKey===fkey)){ AI.tKey=fkey; AI.tCool=8; } plan=null; }
     if(!plan){ AI.strategy='PATROL'; return aiDirOf(body[0], AI_SUCC[body[0]]); }
   } else {
-    plan=aiDfsPlan(st, X, 40000);
+    plan=aiDfsPlan(st, X, X.maxRem>0 ? 40000 : 8000); // no hazard: only a rejoin search, keep it cheap (long torus bodies make each node costly)
     if(!plan.goal){ const alt=aiSearch(st, X, false, Math.max(40, X.maxRem+12), 60000); if(alt && alt.goal) plan=alt; else if(!(plan.moves&&plan.moves.length)) plan=alt; }
     if(plan && !plan.goal && X.maxRem===0) plan=null; // no hazard and no way home: let the greedy planner hunt
     if(plan && plan.moves.length) plan.label = plan.goal ? 'DETOUR' : 'SURVIVING';
@@ -1215,9 +1245,8 @@ function aiDecide(){
     const d=AI_DIRS[name];
     if(d.x===-cur.x && d.y===-cur.y) continue; // reverse: the game rejects it
     const dirs = [d, split?aiMirror(d):null];
-    const nh = snakes.map((s,i)=>({x:s.body[0].x+dirs[i].x, y:s.body[0].y+dirs[i].y}));
+    const nh = snakes.map((s,i)=>({x:(s.body[0].x+dirs[i].x+COLS)%COLS, y:(s.body[0].y+dirs[i].y+ROWS)%ROWS}));
     let dead=false;
-    for(const h of nh) if(h.x<0||h.x>=COLS||h.y<0||h.y>=ROWS) dead=true;
     if(split && nh[0].x===nh[1].x && nh[0].y===nh[1].y) dead=true;
     if(!dead) for(const h of nh){
       if(solid.has(aiKey(h.x,h.y)) || haz.has(aiKey(h.x,h.y))) dead=true;
