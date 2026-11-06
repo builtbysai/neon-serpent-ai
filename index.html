@@ -123,24 +123,40 @@ function reset(){
 function startGame(){ reset(); mode='play'; }
 
 function spawnFoodPair(){
-  // mirrored pair, never on the center column, never near either head
-  for(let tries=0; tries<60; tries++){
-    const x=1+Math.floor(Math.random()*5); // 1..5, mirror 11..7
-    const y=1+Math.floor(Math.random()*(ROWS-2));
-    const mx=COLS-1-x;
-    if(occupied(x,y)||occupied(mx,y)) continue;
-    let near=false;
-    for(const s of snakes){ const h=s.body[0];
-      if(Math.abs(h.x-x)+Math.abs(h.y-y)<3 || Math.abs(h.x-mx)+Math.abs(h.y-y)<3){ near=true; break; } }
-    if(near) continue;
-    foods=[ {x:x,y:y,ph:Math.random()*6.28}, {x:mx,y:y,ph:Math.random()*6.28} ];
-    return;
+  // Enumerate EVERY valid mirrored pair and pick one at random, relaxing the
+  // rules tier by tier, so a fruit always spawns while any empty cell exists.
+  // (The old version tried 60 random cells, then fell back to two unmirrored
+  // corner cells with no `ph` field: the NaN pulse made them invisible and
+  // they were out of reach, so play stalled around score 79.)
+  const tiers=[ {x0:1,x1:5,y0:1,y1:ROWS-2,near:3}, {x0:0,x1:5,y0:0,y1:ROWS-1,near:3}, {x0:0,x1:5,y0:0,y1:ROWS-1,near:0} ];
+  for(const T of tiers){
+    const cand=[];
+    for(let y=T.y0;y<=T.y1;y++) for(let x=T.x0;x<=T.x1;x++){
+      const mx=COLS-1-x;
+      if(x===mx || occupied(x,y)||occupied(mx,y)) continue;
+      let near=false;
+      for(const s of snakes){ const h=s.body[0];
+        if(Math.abs(h.x-x)+Math.abs(h.y-y)<T.near || Math.abs(h.x-mx)+Math.abs(h.y-y)<T.near){ near=true; break; } }
+      if(!near) cand.push({x:x,y:y});
+    }
+    if(cand.length){
+      const c=cand[Math.floor(Math.random()*cand.length)], mx=COLS-1-c.x;
+      foods=[ {x:c.x,y:c.y,ph:Math.random()*6.28}, {x:mx,y:c.y,ph:Math.random()*6.28} ];
+      return;
+    }
   }
-  // fallback: any two empty cells
+  // No mirrored pair exists: relax the rule and use any empty cells (never fruitless).
   const empty=[];
   for(let y=0;y<ROWS;y++) for(let x=0;x<COLS;x++) if(!occupied(x,y)) empty.push({x:x,y:y});
-  if(empty.length>=2){ foods=[empty[0], empty[empty.length-1]]; }
-  else foods=[];
+  if(empty.length>=2){
+    const i=Math.floor(Math.random()*empty.length); let j=Math.floor(Math.random()*(empty.length-1)); if(j>=i) j++;
+    foods=[ {x:empty[i].x,y:empty[i].y,ph:Math.random()*6.28}, {x:empty[j].x,y:empty[j].y,ph:Math.random()*6.28} ];
+  } else if(empty.length===1){
+    foods=[ {x:empty[0].x,y:empty[0].y,ph:Math.random()*6.28} ];
+  } else {
+    // True end state: the board is completely full. Surface it, never stall.
+    foods=[]; die('board full');
+  }
 }
 function spawnHazardPair(){
   if(score<10 || hazards.length>0) return;
@@ -574,6 +590,19 @@ window.__ns={ get mode(){return mode}, get score(){return score}, get best(){ret
 /* Neon Serpent AI — plays the shipped game through its own input.
    Every decision goes through window.__ns.setDir(), the exact function a
    swipe calls. The AI never touches positions, scores, or internals.
+   v8 movement (on top of the v7 brain below): the style is phased by a
+   MEASURED, smooth risk r in [0,1] (aiRisk: how much of the board the two
+   linked bodies forbid, how little room the head can still reach for its
+   length, whether a hazard is live), never by a score threshold.
+   - Low r (open board, short snakes): ROAMING. A* straight to the nearest
+     fruit over exact moving bodies, few turns, light jitter so equal routes
+     vary; the cycle is ignored, the whole board gets used.
+   - Rising r: FOCUSING -> FOCUSED. Off-cycle steps cost more, and a direct
+     route must beat the cycle by a margin that grows with r (the freedom
+     slack shrinks as (1-r)^2). Smooth, no switch.
+   - Every free route is only taken if a proven way HOME exists from where it
+     ends (aiHomeProof), hazards simulated in time; when the cycle is not
+     clean ahead it is not an option at all and the AI goes straight.
    v7 brain:
    - The snakes are one linked walk: magenta is always M(c)=(12-x,y+6) of
      cyan, so cyan's body must never meet M(body). That caps cyan's body at
@@ -868,7 +897,7 @@ function aiSearch(st, X, needEat, Hmax, budget){
         const ns=aiExpand(S,p,t,X); if(!ns) continue;
         seen.add(key);
         if((!needEat||ns.ate) && AI_IDX[p]>=0 &&
-           aiCycleOK(ns.body, ns.grow, t+1, Math.max(0,X.maxRem-(t+1))+30, X)) return aiPlanFrom(ns,true);
+           aiCycleOK(ns.body, ns.grow, t+1, aiCycleNeed(ns.body.length, X, t+1), X)) return aiPlanFrom(ns,true);
         next.push(ns);
       }
     }
@@ -903,18 +932,20 @@ function aiDfsPlan(st, X, nodeCap){
   const ring=new Int16Array(1024), occ=new Uint8Array(247), path=new Int16Array(800);
   const L0=body0.length;
   for(let k=0;k<L0;k++){ ring[(1023-k)&1023]=body0[k]; occ[body0[k]]=1; }
+  const tDfs=performance.now();
   let hd=1023, len=L0, nodes=0, bestT=-1, bestPath=null, succT=-1;
   const taken=[0,0,0,0];
   const T_END = Math.min(X.maxRem, 600);          // hazards are gone at this time
   const T_MAX = T_END + 70;
   function cycleOKNow(g,t){
     const bodyArr=new Array(len); for(let k=0;k<len;k++) bodyArr[k]=ring[(hd-k)&1023];
-    return aiCycleOK(bodyArr, g, t, 30, X);
+    return aiCycleOK(bodyArr, g, t, aiCycleNeed(len, X, t), X);
   }
   function dfs(t,g){
     if(t>=T_END && AI_IDX[ring[hd&1023]]>=0 && cycleOKNow(g,t)){ succT=t; return true; }
     if(t>=T_MAX) return false;
     if(++nodes>nodeCap) return false;
+    if((nodes&255)===0 && performance.now()-tDfs>150){ nodes=nodeCap+1; return false; } // wall-clock guard (real browser)
     if(t>bestT){ bestT=t; bestPath=Array.prototype.slice.call(path,0,t); }
     const h=ring[hd&1023], nbs=AI_NB[h], succ=AI_SUCC[h];
     // order: cycle successor, other cycle cells by forward jump, then the rest
@@ -950,6 +981,114 @@ function aiDfsPlan(st, X, nodeCap){
   return {ok, nodes, moves, goal:ok};
 }
 
+// ---------- v8: risk-phased free movement ----------
+// Risk r in [0,1] is measured, never keyed to a score: how much of the
+// (cyan-space) board the two linked bodies forbid, how little free space the
+// head can still reach for its length, and whether a hazard is live. It is
+// smooth, so the style slides from "go straight for the fruit" to "lean on
+// the cycle" with no switch.
+function aiSmooth(a,b,x){ const t=Math.max(0,Math.min(1,(x-a)/(b-a))); return t*t*(3-2*t); }
+function aiRisk(st, X){
+  const body=st.snakes[0].body.map(c=>AI_ID(c.x,c.y)), L=body.length;
+  const F=new Uint8Array(247);
+  for(const b of body){ F[b]=1; const m=AI_MID[b]; if(m>=0) F[m]=1; const mi=AI_MINV[b]; if(mi>=0) F[mi]=1; }
+  for(let c=0;c<169;c++) if(X.blockUntil[c]>0) F[c]=1;
+  let forb=0; for(let c=0;c<169;c++) if(F[c]) forb++;
+  // flood fill of legal cells from the head
+  const seen=new Uint8Array(247), q=[body[0]]; seen[body[0]]=1; let space=0;
+  for(let i=0;i<q.length;i++){ const c=q[i]; space++;
+    for(const p of AI_NB[c]) if(!seen[p] && !F[p] && AI_MID[p]>=0){ seen[p]=1; q.push(p); } }
+  const fill=forb/169;
+  const tight=Math.max(0, Math.min(1, 1 - space/(1.5*L+10)));
+  const r=Math.max(0, Math.min(1, aiSmooth(0.22,0.80,fill) + 0.3*tight + (st.hazards.length?0.10:0)));
+  return {r:r, fill:fill, space:space, tight:tight};
+}
+// Is there a way home from this state? "Home" = head on the cycle with the
+// whole cycle ahead clear for (body length + hazard time) steps. Layered BFS
+// over (cell,time) with exact moving bodies; no food is assumed.
+function aiCycleNeed(L, X, t){ return Math.min(200, Math.max(30, L+8) + Math.max(0, X.maxRem - t)); }
+function aiHomeProof(S, t0, X0, budget){
+  const X={blockUntil:X0.blockUntil, foodAt:AI_NOFOOD, maxRem:X0.maxRem};
+  const L0=S.body.length;
+  if(AI_IDX[S.body[0]]>=0 && aiCycleOK(S.body, S.grow, t0, aiCycleNeed(L0,X,t0), X)) return true;
+  let layer=[{body:S.body, grow:S.grow, ate:false, parent:null, move:null}];
+  const seen=new Set(); const Hmax=Math.max(24, X.maxRem-t0+14);
+  for(let t=t0;t<t0+Hmax;t++){
+    const next=[];
+    for(const T of layer){
+      for(const p of AI_NB[T.body[0]]){
+        const key=(p*512)+(t-t0); if(seen.has(key)) continue;
+        if(--budget<0) return false;
+        const ns=aiExpand(T,p,t,X); if(!ns) continue;
+        seen.add(key);
+        if(AI_IDX[p]>=0 && aiCycleOK(ns.body, ns.grow, t+1, aiCycleNeed(ns.body.length,X,t+1), X)) return true;
+        next.push(ns);
+      }
+    }
+    if(!next.length) return false;
+    layer=next;
+  }
+  return false;
+}
+const AI_NOFOOD = new Int8Array(247).fill(-1);
+// Direct, purposeful route to the fruit: A* over exact moving bodies. Step cost
+// 1, a small cost per turn (long clean lines read as intent, not wobble), a
+// little jitter (so equal routes vary), and an off-cycle surcharge that grows
+// with risk (late on, equal-length options hug the cycle). Every goal is
+// accepted only if a way home still exists from where it ends.
+function aiForage(st, X, rk){
+  const S0={body:st.snakes[0].body.map(c=>AI_ID(c.x,c.y)), grow:AI.grow, ate:false, parent:null, move:null, g:0, t:0, dir:-1};
+  const cur0=st.snakes[0].dir, hx=S0.body[0]%13, hy=(S0.body[0]/13)|0;
+  const rootRev=AI_ID(hx-cur0.x, hy-cur0.y);
+  const tg=[]; for(let c=0;c<169;c++) if(X.foodAt[c]>=0) tg.push([c%13,(c/13)|0]);
+  if(!tg.length) return null;
+  const H=c=>{ const x=c%13,y=(c/13)|0; let m=99; for(const q of tg){ const d=Math.abs(q[0]-x)+Math.abs(q[1]-y); if(d<m) m=d; } return m; };
+  // Proofs assume every live hazard lasts 2 steps longer than the planner's own
+  // estimate. Each later re-plan re-adds its own 1-step safety margin to a hazard
+  // that has really aged, so a proof built with the same margin goes stale by one
+  // step while the roam executes (that exact slip killed a run at score 23).
+  const XP={blockUntil:X.blockUntil.map(v=>v>0?v+2:0), foodAt:X.foodAt, maxRem:X.maxRem>0?X.maxRem+2:0};
+  const open=[{n:S0,f:H(S0.body[0])}]; const seen=new Set(); let nodes=0, proofs=0;
+  const pushOpen=e=>{ open.push(e); let i=open.length-1; while(i>0){ const p=(i-1)>>1; if(open[p].f<=open[i].f) break; const tmp=open[p]; open[p]=open[i]; open[i]=tmp; i=p; } };
+  const popOpen=()=>{ const top=open[0], last=open.pop(); if(open.length){ open[0]=last; let i=0; for(;;){ let l=2*i+1, r=l+1, m=i; if(l<open.length&&open[l].f<open[m].f) m=l; if(r<open.length&&open[r].f<open[m].f) m=r; if(m===i) break; const tmp=open[m]; open[m]=open[i]; open[i]=tmp; i=m; } } return top; };
+  const tStart=performance.now();
+  while(open.length && nodes<2500){
+    if((nodes&63)===63 && performance.now()-tStart>30) return null; // never stall the game loop
+    const S=popOpen().n;
+    if(S.ate){
+      if(++proofs>5) return null;
+      if(aiHomeProof({body:S.body, grow:S.grow}, S.t, XP, 3000)) return aiPlanFrom(S,true);
+      continue;
+    }
+    if(S.t>=70) continue;
+    for(let di=0;di<4;di++){
+      const d=AI_NEIGH[di], hd=S.body[0], nx=(hd%13)+d.x, ny=((hd/13)|0)+d.y;
+      if(nx<0||nx>12||ny<0||ny>12) continue;
+      const p=AI_ID(nx,ny);
+      if(S.t===0 && p===rootRev) continue;
+      const key=(p*4+di)*2+(S.ate?1:0); if(S.t>0 && seen.has(key)) continue;
+      const ns=aiExpand(S,p,S.t,X); if(!ns) continue;
+      nodes++; seen.add(key);
+      const cost=1 + (S.dir>=0 && S.dir!==di ? 0.18 : 0) + Math.random()*0.04 + (AI_IDX[p]<0 ? 0.55*rk.r : 0);
+      ns.g=S.g+cost; ns.t=S.t+1; ns.dir=di;
+      pushOpen({n:ns, f:ns.g+(ns.ate?0:H(p))});
+    }
+  }
+  return null;
+}
+// Steps the cycle itself needs to reach a fruit, from anywhere (walk to the
+// nearest cycle cell first). Infinity when no fruit cell lies on the cycle.
+function aiCycleCost(st, X){
+  const hx=st.snakes[0].body[0].x, hy=st.snakes[0].body[0].y;
+  let best=Infinity;
+  for(let c=0;c<169;c++){ if(X.foodAt[c]<0 || AI_IDX[c]<0) continue;
+    for(let i=0;i<AI_CYCLE_LEN;i++){ const k=AI_CYCLE_KEYS[i], p=k.split(','); 
+      const walk=Math.abs(+p[0]-hx)+Math.abs(+p[1]-hy);
+      const cd=(AI_IDX[c]-i+AI_CYCLE_LEN)%AI_CYCLE_LEN;
+      if(walk+cd<best) best=walk+cd; } }
+  return best;
+}
+
 function aiNextMove(st){
   if(st.snakes.length!==2) return null;
   const X=aiMakeCtx(st);
@@ -959,10 +1098,31 @@ function aiNextMove(st){
     if(aiPlanValid(AI.plan.moves, st, X)){ const m=AI.plan.moves.shift(); AI.strategy=AI.plan.label; return m; }
     AI.plan=null;
   }
-  // 2. plain patrol when the cycle ahead is clean (K covers every hazard's life)
   const onCyc = AI_IDX[body[0]]>=0;
-  const patrolOK = onCyc && aiCycleOK(body, AI.grow, 0, X.maxRem+30, X);
-  // 3. food the cycle can never reach: plan a verified round trip
+  const patrolOK = onCyc && aiCycleOK(body, AI.grow, 0, aiCycleNeed(body.length, X, 0), X);
+  // 2. phase by measured risk: open board = straight at the fruit; filling
+  //    board = direct routes must beat the cycle by a margin that grows with risk.
+  const rk=aiRisk(st, X); AI.risk=rk.r;
+  // A forage search that found nothing (or whose route lost to the cycle) is not
+  // repeated every tick: same fruit, short cooldown. Keeps decisions cheap.
+  const fkey=st.foods.map(f=>f.x+','+f.y).join('|');
+  if(AI.fCool>0) AI.fCool--;
+  if(st.foods.length && !(AI.fCool>0 && AI.fKey===fkey)){
+    const fp=aiForage(st, X, rk);
+    AI.fKey=fkey; AI.fCool=(fp && fp.moves.length)?0:6;
+    if(fp && fp.moves.length){
+      const lc=aiCycleCost(st, X);
+      // Cycle not clean ahead -> it is not an option, go straight. Otherwise the
+      // direct route is taken unless the cycle is clearly quicker; the slack
+      // (extra steps tolerated for a freer, more direct line) shrinks smoothly
+      // with risk, and the margin the direct route must win by grows with it.
+      const slack = 16*(1-rk.r)*(1-rk.r);
+      const accept = !patrolOK || fp.moves.length*(1+5*rk.r*rk.r) <= lc + slack;
+      if(!accept) AI.fCool=5;
+      if(accept){ fp.label = rk.r<0.33 ? 'ROAMING' : (rk.r<0.66 ? 'FOCUSING' : 'FOCUSED'); AI.plan=fp; const m=fp.moves.shift(); AI.strategy=fp.label; return m; }
+    }
+  }
+  // 3. the cycle backbone and its hazard detours (v7)
   let wantTrip=false;
   if(patrolOK && st.foods.length){
     wantTrip = !st.foods.some(f=>{ const fc=AI_ID(f.x,f.y); const mi=AI_MINV[fc];
@@ -971,12 +1131,13 @@ function aiNextMove(st){
   if(patrolOK && !wantTrip){ AI.strategy='PATROL'; return aiDirOf(body[0], AI_SUCC[body[0]]); }
   let plan=null;
   if(wantTrip){
-    plan=aiSearch(st, X, true, 70, 40000);
+    if(AI.tCool>0) AI.tCool--;
+    plan = (AI.tCool>0 && AI.tKey===fkey) ? null : aiSearch(st, X, true, 70, 40000);
     if(plan && plan.goal && plan.moves.length){ plan.label='EXCURSION'; }
-    else plan=null;
+    else { if(!(AI.tCool>0 && AI.tKey===fkey)){ AI.tKey=fkey; AI.tCool=8; } plan=null; }
     if(!plan){ AI.strategy='PATROL'; return aiDirOf(body[0], AI_SUCC[body[0]]); }
   } else {
-    plan=aiDfsPlan(st, X, 150000);
+    plan=aiDfsPlan(st, X, 40000);
     if(!plan.goal){ const alt=aiSearch(st, X, false, Math.max(40, X.maxRem+12), 60000); if(alt && alt.goal) plan=alt; else if(!(plan.moves&&plan.moves.length)) plan=alt; }
     if(plan && !plan.goal && X.maxRem===0) plan=null; // no hazard and no way home: let the greedy planner hunt
     if(plan && plan.moves.length) plan.label = plan.goal ? 'DETOUR' : 'SURVIVING';
@@ -1153,7 +1314,7 @@ function aiRunOver(){
 function aiPoll(){
   const st = aiState(); if(!st) return;
   if(st.mode==='play' && AI.lastMode!=='play'){
-    AI.grow=0; AI.lastScore=0; AI.lastHeads=''; AI.lastSplit=false; AI.ticksSinceEat=0; AI.plan=null;
+    AI.grow=0; AI.lastScore=0; AI.lastHeads=''; AI.lastSplit=false; AI.ticksSinceEat=0; AI.plan=null; AI.fCool=0; AI.fKey=''; AI.tCool=0; AI.tKey='';
   }
   // Normal speed only: the game's own loop steps, the poll decides once
   // after each observed step.
